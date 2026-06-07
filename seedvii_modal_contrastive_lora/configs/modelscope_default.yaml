@@ -52,7 +52,7 @@ loss:
   beta_llm: 0.35
 
 train:
-  batch_size: 48
+  batch_size: 96
   steps_per_epoch: 300
   epochs: 50
   lr_eeg: 0.001

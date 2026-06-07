@@ -4,7 +4,7 @@ Dataset and Sampler for SEED-VII EEG-LLM Contrastive Learning
 优化:
 - LRU缓存NPZ分片
 - 预分配numpy数组减少内存分配
-- 异步数据加载准备
+- 直接返回tensor避免中间转换
 """
 from __future__ import annotations
 
@@ -24,8 +24,10 @@ from .protocol import load_l2_text_protocol, trial_to_labels
 
 def load_index(npz_dir: str | Path) -> pd.DataFrame:
     """加载NPZ目录的窗口索引"""
-    df = pd.read_csv(Path(npz_dir) / "index.csv")
-    df["abs_shard"] = df["shard"].apply(lambda s: str(Path(npz_dir) / s))
+    npz_dir = Path(npz_dir)
+    df = pd.read_csv(npz_dir / "index.csv")
+    # 确保abs_shard是字符串类型
+    df["abs_shard"] = df["shard"].astype(str).apply(lambda s: str(npz_dir / s))
     return df
 
 
@@ -88,7 +90,13 @@ class WindowNpzDataset(Dataset):
         text_csv_path: str | Path,
         cache_size: int = 8,
     ):
+        # 重新索引并确保所有列都是标量值
         self.df = df.reset_index(drop=True)
+        
+        # 确保abs_shard列是字符串类型
+        if "abs_shard" in self.df.columns:
+            self.df["abs_shard"] = self.df["abs_shard"].astype(str)
+        
         # 预计算归一化参数
         self.mean = channel_mean.astype(np.float32)[:, None]
         self.std = channel_std.astype(np.float32)[:, None]
@@ -102,13 +110,15 @@ class WindowNpzDataset(Dataset):
 
     def _load_shard(self, path: str) -> dict:
         """LRU缓存加载NPZ分片"""
-        if path in self.cache:
-            self.cache.move_to_end(path)
-            return self.cache[path]
+        # 确保path是字符串
+        path_str = str(path)
+        if path_str in self.cache:
+            self.cache.move_to_end(path_str)
+            return self.cache[path_str]
         
-        with np.load(path) as z:
+        with np.load(path_str) as z:
             item = {k: z[k] for k in z.files}
-        self.cache[path] = item
+        self.cache[path_str] = item
         
         if len(self.cache) > self.cache_size:
             self.cache.popitem(last=False)
@@ -116,21 +126,26 @@ class WindowNpzDataset(Dataset):
 
     def __getitem__(self, i: int) -> dict:
         row = self.df.iloc[i]
-        shard = self._load_shard(row.abs_shard)
+        
+        # 确保获取标量值（避免Series问题）
+        shard_path = str(row["abs_shard"])
+        shard_idx = int(row["idx"])
+        
+        shard = self._load_shard(shard_path)
         
         # 加载并归一化EEG数据
-        x = shard["x"][int(row.idx)].astype(np.float32)
+        x = shard["x"][shard_idx].astype(np.float32)
         x = (x - self.mean) / (self.std + 1e-6)
         
-        y = int(row.label3)
-        tid = int(row.trial)
+        y = int(row["label3"])
+        tid = int(row["trial"])
         text = self.text_by_trial[tid]
         
         return {
             "eeg": torch.from_numpy(x).unsqueeze(0),  # (1, 62, T)
             "label": torch.tensor(y, dtype=torch.long),
             "text": text,
-            "subject": int(row.subject),
+            "subject": int(row["subject"]),
             "trial": tid,
         }
 

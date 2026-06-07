@@ -60,12 +60,20 @@ class LoRATextTower(nn.Module):
             dtype = torch.bfloat16
         self._dtype = dtype
         
-        # 加载基础模型
-        base = AutoModelForCausalLM.from_pretrained(
-            model_name_or_path,
-            trust_remote_code=trust_remote_code,
-            torch_dtype=dtype,
-        )
+        # 加载基础模型。新版 transformers 推荐 dtype=，旧版仍使用 torch_dtype=；
+        # 这里做兼容，避免训练日志里出现无意义的 deprecation warning。
+        try:
+            base = AutoModelForCausalLM.from_pretrained(
+                model_name_or_path,
+                trust_remote_code=trust_remote_code,
+                dtype=dtype,
+            )
+        except TypeError:
+            base = AutoModelForCausalLM.from_pretrained(
+                model_name_or_path,
+                trust_remote_code=trust_remote_code,
+                torch_dtype=dtype,
+            )
 
         self.hidden_size = base.config.hidden_size
         

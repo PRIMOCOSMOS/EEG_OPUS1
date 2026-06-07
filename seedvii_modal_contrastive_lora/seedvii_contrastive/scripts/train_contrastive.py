@@ -408,9 +408,13 @@ def main():
     gpu_monitor.log_memory("Initial")
     
     # 混合精度配置
+    # 注意：BF16 AMP 不需要也不应该使用 GradScaler。GradScaler 是 FP16 用的；
+    # 在部分 PyTorch/CUDA 组合中，对 BF16 梯度执行 unscale_ 会触发：
+    # NotImplementedError: _amp_foreach_non_finite_check_and_unscale_cuda not implemented for 'BFloat16'
     use_amp = _is_cuda_device(device)
+    amp_dtype = torch.bfloat16
     print(f"[Train] AMP BF16: {'enabled' if use_amp else 'disabled'}")
-    scaler = torch.amp.GradScaler('cuda') if use_amp else None
+    scaler = None
     
     out_dir = Path(cfg["runtime"]["output_dir"])
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -571,25 +575,24 @@ def main():
             
             # ========== 反向传播 ==========
             opt.zero_grad(set_to_none=True)
-            if use_amp:
+
+            if scaler is not None:
+                # 仅 FP16 AMP 需要 GradScaler；当前默认是 BF16，所以通常不会进入这里。
                 scaler.scale(loss).backward()
                 scaler.unscale_(opt)
-                
-                clip_params = [p for p in eeg.parameters() if p.requires_grad]
-                if train_llm:
-                    clip_params.extend([p for p in text.parameters() if p.requires_grad])
-                torch.nn.utils.clip_grad_norm_(clip_params, max_norm=1.0)
-                
+            else:
+                # BF16 AMP 直接反传，不做 loss scaling / unscale。
+                loss.backward()
+
+            clip_params = [p for p in eeg.parameters() if p.requires_grad]
+            if train_llm:
+                clip_params.extend([p for p in text.parameters() if p.requires_grad])
+            torch.nn.utils.clip_grad_norm_(clip_params, max_norm=1.0)
+
+            if scaler is not None:
                 scaler.step(opt)
                 scaler.update()
             else:
-                loss.backward()
-                
-                clip_params = [p for p in eeg.parameters() if p.requires_grad]
-                if train_llm:
-                    clip_params.extend([p for p in text.parameters() if p.requires_grad])
-                torch.nn.utils.clip_grad_norm_(clip_params, max_norm=1.0)
-                
                 opt.step()
             
             t_gpu = time.perf_counter() - t_gpu_start

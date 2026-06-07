@@ -2,6 +2,11 @@
 SEED-VII EEG-LLM 对比学习训练脚本 - GPU优化版
 
 优化目标: 最大化GPU利用率，减少CPU-GPU数据传输瓶颈
+
+关键设计:
+- LoRA训练是默认行为（不可妥协）
+- EEG + LLM 双塔联合训练
+- 混合精度 (BF16) + GPU优化
 """
 from __future__ import annotations
 
@@ -15,8 +20,6 @@ import argparse
 from pathlib import Path
 from collections import Counter
 import time
-import threading
-from queue import Queue
 
 import numpy as np
 import torch
@@ -33,7 +36,7 @@ from seedvii_contrastive.models.eegnet import EEGNetEncoder
 from seedvii_contrastive.models.llm_tower import LoRATextTower
 from seedvii_contrastive.losses import TriContrastiveLoss
 from seedvii_contrastive.metrics import accuracy_macro_f1
-from seedvii_contrastive.utils import load_yaml, save_json, set_seed, resolve_device
+from seedvii_contrastive.utils import load_yaml, set_seed, resolve_device
 
 
 # =============== GPU 监控工具 ===============
@@ -42,18 +45,14 @@ class GPUMonitor:
     def __init__(self, device):
         self.device = device
         self.enabled = torch.cuda.is_available()
-        self._utilization_history = []
         
     def get_utilization(self) -> float:
-        """获取GPU利用率百分比"""
         if not self.enabled:
             return 0.0
         try:
             import pynvml
             pynvml.nvmlInit()
-            handle = pynvml.nvmlDeviceGetHandleByIndex(
-                0 if self.device.type == 'cuda' else int(str(self.device).split(':')[-1])
-            )
+            handle = pynvml.nvmlDeviceGetHandleByIndex(0)
             util = pynvml.nvmlDeviceGetUtilizationRates(handle)
             pynvml.nvmlShutdown()
             return util.gpu
@@ -61,80 +60,21 @@ class GPUMonitor:
             return -1.0
     
     def log_memory(self, tag: str = ""):
-        """记录GPU内存使用"""
         if self.enabled:
             mem_alloc = torch.cuda.memory_allocated(self.device) / 1024**3
             mem_reserved = torch.cuda.memory_reserved(self.device) / 1024**3
             print(f"[GPU] {tag} mem_alloc={mem_alloc:.2f}GB mem_reserved={mem_reserved:.2f}GB")
 
 
-# =============== 优化后的collate_fn ===============
+# =============== collate_fn ===============
 def collate_fn(batch):
-    """优化的collate函数，减少Python对象创建开销"""
+    """将batch列表整理成张量格式"""
     return {
         "eeg": torch.stack([b["eeg"] for b in batch], dim=0),
         "label": torch.stack([b["label"] for b in batch], dim=0),
-        "texts": [b["text"] for b in batch],  # 重命名避免冲突
-        "subjects": [b["subject"] for b in batch],
-        "trials": torch.as_tensor([b["trial"] for b in batch], dtype=torch.int64),  # 使用tensor
+        "texts": [b["text"] for b in batch],
+        "trials": torch.as_tensor([b["trial"] for b in batch], dtype=torch.int64),
     }
-
-
-# =============== 异步数据预加载器 ===============
-class AsyncDataLoader:
-    """异步数据预加载器，将CPU负载与GPU计算重叠"""
-    def __init__(self, dataset, sampler, batch_size, device, pin_memory=True, num_workers=4, prefetch_factor=2):
-        self.dataloader = DataLoader(
-            dataset,
-            batch_size=batch_size,
-            sampler=sampler,
-            num_workers=num_workers,
-            collate_fn=collate_fn,
-            pin_memory=pin_memory,
-            prefetch_factor=prefetch_factor,
-            persistent_workers=num_workers > 0,
-        )
-        self.device = device
-        self.queue = Queue(maxsize=2)
-        self.thread = None
-        self._stop = False
-        
-    def start(self):
-        """启动后台预加载线程"""
-        if self.thread is None:
-            self._stop = False
-            self.thread = threading.Thread(target=self._preload_loop, daemon=True)
-            self.thread.start()
-            
-    def _preload_loop(self):
-        """后台预加载循环"""
-        iterator = iter(self.dataloader)
-        while not self._stop:
-            try:
-                batch = next(iterator)
-                # 将数据放到GPU上（异步）
-                batch_gpu = {
-                    "eeg": batch["eeg"].to(self.device, non_blocking=True),
-                    "label": batch["label"].to(self.device, non_blocking=True),
-                    "texts": batch["texts"],
-                    "trials": batch["trials"].to(self.device, non_blocking=True),
-                }
-                self.queue.put((batch_gpu, batch["texts"]), timeout=0.1)
-            except StopIteration:
-                break
-            except Exception as e:
-                if not self._stop:
-                    pass
-                    
-    def get_batch(self, timeout=1.0):
-        """获取预加载的batch"""
-        return self.queue.get(timeout=timeout)
-    
-    def stop(self):
-        """停止预加载"""
-        self._stop = True
-        if self.thread:
-            self.thread.join(timeout=1.0)
 
 
 # =============== 路径解析函数 ===============
@@ -171,17 +111,17 @@ def resolve_llm_model_path(llm_cfg: dict) -> str:
         for root in search_roots:
             found = _find_local_llm_dir(root, preferred_name=p.name)
             if found is not None:
-                print(f"[LLM Tower] resolved local model path: {raw} -> {found}")
+                print(f"[LLM Tower] resolved: {raw} -> {found}")
                 return str(found)
 
-    model_id = llm_cfg.get("modelscope_model_id") or llm_cfg.get("hf_model_id") or "Qwen/Qwen2.5-0.5B-Instruct"
+    model_id = llm_cfg.get("modelscope_model_id") or "Qwen/Qwen2.5-0.5B-Instruct"
     cache_dir = str(p.parent if p.parent != Path("") else Path("/mnt/workspace/models"))
-    print(f"[LLM Tower][WARN] local model path does not exist: {raw}")
+    print(f"[LLM Tower][WARN] path not found: {raw}")
     
     try:
         from modelscope import snapshot_download
         model_dir = snapshot_download(model_id, cache_dir=cache_dir)
-        print(f"[LLM Tower] downloaded model_dir={model_dir}")
+        print(f"[LLM Tower] downloaded: {model_dir}")
         return str(model_dir)
     except Exception as e:
         raise FileNotFoundError(f"Cannot resolve LLM path: {e}") from e
@@ -189,22 +129,20 @@ def resolve_llm_model_path(llm_cfg: dict) -> str:
 
 # =============== 预计算函数 ===============
 def precompute_text_embeddings(text_tower, texts: list, device, batch_size: int = 16):
-    """预计算所有文本嵌入，使用优化配置"""
+    """预计算所有文本嵌入"""
     print(f"[Precompute] Encoding {len(texts)} text embeddings...")
     text_tower.eval()
     
     all_embeddings = []
     with torch.no_grad():
-        # 使用BF16加速预计算
         with autocast("cuda", dtype=torch.bfloat16):
             for i in range(0, len(texts), batch_size):
                 batch = texts[i:i+batch_size]
                 emb = text_tower(batch)
-                # 转换为float32存储（与EEG塔一致）
                 all_embeddings.append(emb.float().cpu())
                 
     text_embeddings = torch.cat(all_embeddings, dim=0)
-    print(f"[Precompute] Done. Embeddings shape: {text_embeddings.shape}, dtype={text_embeddings.dtype}")
+    print(f"[Precompute] Done. shape={text_embeddings.shape}")
     return text_embeddings
 
 
@@ -224,16 +162,21 @@ def build_class_prototypes(text_embeddings, text_labels, device):
 
 
 # =============== 模型构建 ===============
-def build_models(cfg, device, train_llm: bool = False):
-    """构建双塔模型"""
+def build_models(cfg, device, train_llm: bool = True):
+    """构建双塔模型
+    
+    Args:
+        cfg: 配置字典
+        device: 计算设备
+        train_llm: 是否训练LoRA (默认True，LoRA训练不可妥协)
+    """
     mcfg = cfg["model"]
     
-    # 构建EEG编码器（float32以确保数值稳定）
-    eeg = EEGNetEncoder(embed_dim=mcfg["embed_dim"], **mcfg["eegnet"]).to(device)
-    eeg = eeg.float()  # 确保float32
+    # EEG编码器
+    eeg = EEGNetEncoder(embed_dim=mcfg["embed_dim"], **mcfg["eegnet"]).to(device).float()
     print(f"[EEG Net] parameters: {sum(p.numel() for p in eeg.parameters()):,}")
     
-    # 构建LLM文本塔
+    # LLM文本塔
     llm_cfg = mcfg["llm"]
     llm_path = resolve_llm_model_path(llm_cfg)
     
@@ -246,36 +189,44 @@ def build_models(cfg, device, train_llm: bool = False):
         target_modules=llm_cfg.get("target_modules"),
         max_length=llm_cfg.get("max_length", 64),
         gradient_checkpointing=llm_cfg.get("gradient_checkpointing", False),
-        dtype=torch.bfloat16,  # LLM使用BF16加速，损失函数会转换
+        dtype=torch.bfloat16,
     ).to(device)
     
-    # 配置LoRA训练模式
+    # ========== LoRA训练模式配置 ==========
     if train_llm:
+        # LoRA训练：解冻LoRA参数
         text.unfreeze_lora()
-        print(f"[LLM Tower] Training mode: LoRA ENABLED")
+        text.train()  # 确保Dropout等层正确工作
+        print(f"[LLM Tower] *** LoRA TRAINING MODE ***")
     else:
+        # 推理模式：冻结所有参数
         text.freeze_all_except_lora()
-        text.eval()  # 推理模式设置eval
-        print(f"[LLM Tower] Inference mode: LLM FROZEN")
+        text.eval()
+        print(f"[LLM Tower] *** INFERENCE MODE (LLM frozen) ***")
     
     print(f"[LLM Tower] {text.trainable_parameters_report()}")
     
-    # 预热GPU（减少首次计算延迟）
+    # GPU预热
     if torch.cuda.is_available():
         with torch.no_grad():
             dummy = torch.zeros(1, 1, 62, 800, device=device)
             _ = eeg(dummy)
             if train_llm:
-                dummy_text = ["warmup"]
-                _ = text(dummy_text)
+                _ = text(["warmup"])
         torch.cuda.synchronize()
         print("[GPU] Warmup completed")
     
     return eeg, text
 
 
-def build_optimizer(cfg, eeg, text, train_llm: bool = False):
-    """构建优化器"""
+def build_optimizer(cfg, eeg, text, train_llm: bool = True):
+    """构建优化器
+    
+    优化器配置:
+    - EEG塔: lr_eeg
+    - LoRA参数: lr_llm
+    - proj层: lr_proj
+    """
     tcfg = cfg["train"]
     
     param_groups = [
@@ -283,15 +234,18 @@ def build_optimizer(cfg, eeg, text, train_llm: bool = False):
     ]
     
     if train_llm:
+        # LoRA参数
         lora_params = text.get_lora_parameters()
         if lora_params:
             param_groups.append({"params": lora_params, "lr": tcfg["lr_llm"]})
             print(f"[Optimizer] LoRA params: {len(lora_params)}, lr={tcfg['lr_llm']}")
         
+        # proj层
         proj_params = [p for p in text.proj.parameters() if p.requires_grad]
         if proj_params:
-            param_groups.append({"params": proj_params, "lr": tcfg.get("lr_proj", tcfg["lr_llm"])})
-            print(f"[Optimizer] proj params: {len(proj_params)}")
+            lr_proj = tcfg.get("lr_proj", tcfg["lr_llm"])
+            param_groups.append({"params": proj_params, "lr": lr_proj})
+            print(f"[Optimizer] proj params: {len(proj_params)}, lr={lr_proj}")
     
     return torch.optim.AdamW(param_groups, weight_decay=tcfg.get("weight_decay", 1e-5))
 
@@ -299,7 +253,7 @@ def build_optimizer(cfg, eeg, text, train_llm: bool = False):
 # =============== 评估函数 ===============
 @torch.no_grad()
 def evaluate(eeg, class_z, loader, device):
-    """评估模式"""
+    """评估模式：仅使用EEG编码器"""
     eeg.eval()
     ys, preds = [], []
     
@@ -312,7 +266,6 @@ def evaluate(eeg, class_z, loader, device):
             logits = z @ class_z.float().t()
         
         pred = logits.argmax(dim=1).cpu()
-        
         ys.extend(y.numpy().tolist())
         preds.extend(pred.numpy().tolist())
     
@@ -348,14 +301,18 @@ def load_ckpt(path, eeg, text, opt=None, sched=None, device="cpu"):
 
 # =============== 主训练循环 ===============
 def main():
-    ap = argparse.ArgumentParser(description="Optimized EEG-LLM Contrastive Training")
+    ap = argparse.ArgumentParser(
+        description="EEG-LLM Contrastive Training with LoRA (Default: LoRA ENABLED)"
+    )
     ap.add_argument("--config", required=True)
     ap.add_argument("--npz-dir", default=None)
     ap.add_argument("--output-dir", default=None)
-    ap.add_argument("--train-llm", action="store_true")
+    # ========== 关键修改：LoRA训练改为默认开启 ==========
+    ap.add_argument("--no-train-llm", action="store_true", 
+                    help="Disable LoRA training (use cached text embeddings)")
     ap.add_argument("--resume", action="store_true", default=None)
     ap.add_argument("--no-resume", action="store_true")
-    ap.add_argument("--log-interval", type=int, default=10, help="Log interval in steps")
+    ap.add_argument("--log-interval", type=int, default=10)
     args = ap.parse_args()
 
     cfg = load_yaml(args.config)
@@ -369,13 +326,14 @@ def main():
     elif args.resume is not None:
         cfg["train"]["resume"] = args.resume
     
-    train_llm = args.train_llm
+    # ========== LoRA训练默认开启 ==========
+    train_llm = not args.no_train_llm
     log_interval = args.log_interval
     
     print("=" * 70)
-    print("TRAINING CONFIGURATION")
+    print("                    TRAINING CONFIGURATION                    ")
     print("=" * 70)
-    print(f"  train_llm: {train_llm}")
+    print(f"  LoRA Training: {'ENABLED (Default)' if train_llm else 'DISABLED'}")
     print(f"  log_interval: {log_interval}")
     print("=" * 70)
 
@@ -393,13 +351,12 @@ def main():
     device = resolve_device(cfg["runtime"].get("device", "auto"))
     print(f"[Train] device={device}")
     
-    # 初始化GPU监控
     gpu_monitor = GPUMonitor(device)
     gpu_monitor.log_memory("Initial")
     
-    # 混合精度配置 (使用新版API)
+    # 混合精度配置
     use_amp = torch.cuda.is_available()
-    print(f"[Train] Mixed Precision (AMP BF16): {'enabled' if use_amp else 'disabled'}")
+    print(f"[Train] AMP BF16: {'enabled' if use_amp else 'disabled'}")
     scaler = torch.amp.GradScaler('cuda') if use_amp else None
     
     out_dir = Path(cfg["runtime"]["output_dir"])
@@ -409,7 +366,7 @@ def main():
     print("\n[Step 1/6] Loading dataset...")
     df = load_index(dcfg["npz_dir"])
     tr_df, va_df = split_index_by_subjects(df, dcfg["train_subjects"], dcfg["val_subjects"])
-    print(f"[Data] train windows={len(tr_df)} val windows={len(va_df)}")
+    print(f"[Data] train={len(tr_df)}, val={len(va_df)}")
 
     tr_labels = tr_df["label3"].tolist()
     print(f"[Data] class counts: {dict(sorted(Counter(tr_labels).items()))}")
@@ -443,21 +400,16 @@ def main():
     print(f"\n[Step 3/6] Precomputing text embeddings...")
     text_embeddings = precompute_text_embeddings(text, bank_texts, device, batch_size=32)
     class_z = build_class_prototypes(text_embeddings, bank_labels, device)
-    
-    # 预计算的文本嵌入移到GPU（一次性）
     text_embeddings_gpu = text_embeddings.to(device, non_blocking=True)
-    
-    # Trial索引映射（保持简单列表查找）
     trial_to_emb_idx = [trial - 1 for trial in range(1, 81)]
     
     # ==================== 数据加载器 ====================
-    print("\n[Step 4/6] Setting up optimized data loaders...")
+    print("\n[Step 4/6] Setting up data loaders...")
     tcfg = cfg["train"]
     num_workers = tcfg.get("num_workers", 4)
     batch_size = tcfg["batch_size"]
     prefetch_factor = tcfg.get("prefetch_factor", 2)
     
-    # 训练采样器
     train_sampler = ClassBalancedBatchSampler(
         train_ds.df["label3"].tolist(),
         batch_size=batch_size,
@@ -465,7 +417,6 @@ def main():
         seed=cfg.get("seed", 42),
     )
     
-    # 优化的训练数据加载器
     train_loader = DataLoader(
         train_ds,
         batch_size=batch_size,
@@ -474,10 +425,9 @@ def main():
         collate_fn=collate_fn,
         pin_memory=True,
         prefetch_factor=prefetch_factor,
-        persistent_workers=True,  # 保持worker进程
+        persistent_workers=True,
     )
     
-    # 验证数据加载器
     val_loader = DataLoader(
         val_ds,
         batch_size=batch_size,
@@ -489,8 +439,7 @@ def main():
         persistent_workers=True,
     )
     
-    print(f"[DataLoader] batch_size={batch_size}, num_workers={num_workers}, prefetch={prefetch_factor}")
-    print(f"[DataLoader] train samples={len(train_sampler)}, val samples={len(val_loader)}")
+    print(f"[DataLoader] batch={batch_size}, workers={num_workers}, prefetch={prefetch_factor}")
 
     # ==================== 优化器设置 ====================
     print("\n[Step 5/6] Setting up optimizer...")
@@ -525,11 +474,12 @@ def main():
         print(f"           LoRA trainable: {sum(p.numel() for p in text.get_lora_parameters()):,}")
     print("=" * 70)
     
-    # 训练统计
     total_train_time = 0.0
-    total_gpu_time = 0.0
     
     for epoch in range(start_epoch, tcfg["epochs"]):
+        # 重置数据迭代器，确保每个epoch从头开始
+        data_iter = iter(train_loader)
+        
         train_sampler.set_epoch(epoch)
         eeg.train()
         if train_llm:
@@ -539,17 +489,15 @@ def main():
         epoch_losses = []
         epoch_inter = []
         
-        # 启用cudnn benchmark
         torch.backends.cudnn.benchmark = True
         
         batch_times = []
         gpu_times = []
         
         for batch_idx, _ in enumerate(pbar):
-            # 计时：数据加载
             t_data_start = time.perf_counter()
             
-            # 获取数据（使用迭代器避免重复创建开销）
+            # ========== 获取数据 ==========
             try:
                 batch = next(data_iter)
             except StopIteration:
@@ -560,18 +508,15 @@ def main():
             y = batch["label"].to(device, non_blocking=True)
             trials = batch["trials"]
             
-            t_data_end = time.perf_counter()
-            t_data = t_data_end - t_data_start
-            
-            # 计时：GPU计算
+            t_data = time.perf_counter() - t_data_start
             t_gpu_start = time.perf_counter()
             
-            # 前向传播
+            # ========== 前向传播 ==========
             with autocast("cuda", enabled=use_amp, dtype=torch.bfloat16):
                 eeg_z = eeg(x)
                 
                 if train_llm:
-                    # 训练模式：实时计算文本嵌入
+                    # 训练模式：实时计算文本嵌入（带梯度）
                     text_z = text(batch["texts"])
                 else:
                     # 推理模式：使用缓存的文本嵌入
@@ -581,8 +526,8 @@ def main():
                 loss_dict = criterion(eeg_z, text_z, y)
                 loss = loss_dict["loss"]
             
-            # 反向传播
-            opt.zero_grad(set_to_none=True)  # 更高效的梯度清零
+            # ========== 反向传播 ==========
+            opt.zero_grad(set_to_none=True)
             if use_amp:
                 scaler.scale(loss).backward()
                 scaler.unscale_(opt)
@@ -604,14 +549,11 @@ def main():
                 
                 opt.step()
             
-            t_gpu_end = time.perf_counter()
-            t_gpu = t_gpu_end - t_gpu_start
-            
+            t_gpu = time.perf_counter() - t_gpu_start
             total_train_time += t_data + t_gpu
             batch_times.append(t_data)
             gpu_times.append(t_gpu)
             
-            # 延迟更新进度条（减少同步开销）
             epoch_losses.append(loss.item())
             epoch_inter.append(loss_dict["inter"].item())
             
@@ -623,15 +565,11 @@ def main():
                 pbar.set_postfix({
                     "loss": f"{loss.item():.4f}",
                     "inter": f"{loss_dict['inter'].item():.4f}",
-                    "batch_time": f"{avg_batch_time*1000:.1f}ms",
-                    "gpu_time": f"{avg_gpu_time*1000:.1f}ms",
+                    "t": f"{avg_batch_time*1000:.0f}ms",
                     "gpu%": f"{gpu_util:.0f}%" if gpu_util >= 0 else "N/A",
                 })
             
             step += 1
-        
-        # 数据迭代器重置
-        data_iter = iter(train_loader)
         
         sched.step()
         
@@ -639,19 +577,14 @@ def main():
         metrics = evaluate(eeg, class_z, val_loader, device)
         avg_loss = sum(epoch_losses) / len(epoch_losses)
         avg_inter = sum(epoch_inter) / len(epoch_inter)
-        
-        # Epoch统计
         epoch_time = sum(batch_times)
         avg_gpu_util = gpu_monitor.get_utilization()
         
         print(f"epoch {epoch}: loss={avg_loss:.4f} inter={avg_inter:.4f} "
               f"acc={metrics['acc']:.4f} f1={metrics['macro_f1']:.4f}")
-        print(f"  [Stats] epoch_time={epoch_time:.1f}s, avg_batch={epoch_time/len(train_sampler)*1000:.1f}ms, "
-              f"avg_gpu_util={avg_gpu_util:.1f}%" if avg_gpu_util >= 0 else "")
+        print(f"  [Stats] time={epoch_time:.1f}s, avg_batch={epoch_time/len(train_sampler)*1000:.0f}ms, "
+              f"gpu_util={avg_gpu_util:.0f}%" if avg_gpu_util >= 0 else "")
         
-        gpu_monitor.log_memory(f"After epoch {epoch}")
-        
-        # 保存检查点
         if metrics["macro_f1"] >= best_metric:
             best_metric = metrics["macro_f1"]
             save_ckpt(out_dir / "best.pt", eeg, text, opt, sched, epoch, step, best_metric, cfg)
@@ -660,7 +593,7 @@ def main():
         save_ckpt(ckpt_path, eeg, text, opt, sched, epoch, step, best_metric, cfg)
 
     print(f"\n[Train] Complete. best_metric={best_metric:.4f}")
-    print(f"[Stats] Total training time: {total_train_time:.1f}s")
+    print(f"[Stats] Total time: {total_train_time:.1f}s")
 
 
 if __name__ == "__main__":

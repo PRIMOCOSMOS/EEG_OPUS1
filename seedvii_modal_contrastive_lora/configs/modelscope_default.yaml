@@ -1,0 +1,58 @@
+seed: 42
+runtime:
+  device: auto
+  output_dir: /mnt/workspace/seedvii_contrastive_runs/run_valence3
+  max_hours: 9.5
+  save_every_minutes: 30
+
+data:
+  modelscope_dataset_id: DEREKVERSE/SEED-VII
+  local_dataset_dir: /mnt/workspace/seedvii_ms_dataset
+  eeg_root: /mnt/workspace/seedvii_ms_dataset/EEG_preprocessed
+  text_csv_path: /mnt/workspace/seedvii_ms_dataset/text_protocol.csv
+  npz_dir: /mnt/workspace/seedvii_npz
+  fs: 200
+  window_sec: 4.0
+  stride_sec: 4.0      # non-overlap windows as requested
+  center_ratio: 0.60
+  max_windows_per_clip: 12
+  shard_size: 512
+  train_subjects: [1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16]
+  val_subjects: [17,18,19,20]
+  cache_size: 8
+
+model:
+  embed_dim: 128
+  eegnet:
+    chans: 62
+    samples: 800
+    F1: 8
+    D: 2
+    F2: 16
+    kernel_length: 64
+    dropout: 0.3
+  llm:
+    # Recommended to set this to a local path downloaded by modelscope.snapshot_download in the notebook.
+    model_name_or_path: /mnt/workspace/models/Qwen2.5-0.5B-Instruct
+    max_length: 64
+    lora_r: 8
+    lora_alpha: 16
+    lora_dropout: 0.10
+    target_modules: [q_proj, k_proj, v_proj, o_proj]
+    gradient_checkpointing: false
+
+loss:
+  temperature: 0.07
+  beta_eeg: 0.65
+  beta_llm: 0.35
+
+train:
+  batch_size: 96
+  steps_per_epoch: 300
+  epochs: 50
+  lr_eeg: 0.001
+  lr_llm: 0.00002
+  lr_proj: 0.0002
+  weight_decay: 0.00001
+  num_workers: 2
+  resume: true

@@ -1,12 +1,25 @@
+[project]
+name = "seedvii-contrastive"
+version = "0.1.0"
+description = "SEED-VII EEGNet + LoRA-LLM tri-class contrastive learning"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "torch>=2.0.0",
+    "transformers>=4.36.0",
+    "peft>=0.7.0",
+    "numpy>=1.24.0",
+    "pandas>=2.0.0",
+    "PyYAML>=6.0",
+    "tqdm>=4.65.0",
+    "scipy>=1.11.0",
+    "h5py>=3.9.0",
+]
+
 [build-system]
-requires = ["setuptools>=61"]
+requires = ["setuptools>=61.0"]
 build-backend = "setuptools.build_meta"
 
-[project]
-name = "seedvii-modal-contrastive-lora"
-version = "0.1.0"
-description = "SEED-VII EEGNet and LoRA LLM contrastive training pipeline for ModelScope"
-requires-python = ">=3.10"
-
 [tool.setuptools.packages.find]
+where = ["."]
 include = ["seedvii_contrastive*"]

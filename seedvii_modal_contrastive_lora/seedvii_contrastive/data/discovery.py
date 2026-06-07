@@ -8,12 +8,7 @@ SUBJECT_FILE_NAMES = {f"{i}.mat" for i in range(1, 21)} | {f"{i:02d}.mat" for i 
 
 
 def _is_l2_text_csv(path: Path) -> bool:
-    """Return True if CSV looks like Brain-CLIPLM text protocol.
-
-    Expected columns: trial/video_id/id and l2_text/text/sentence/description.
-    This allows the CSV to live in the dataset root and to have a non-exact
-    filename, as long as the protocol columns are correct.
-    """
+    """Return True if CSV looks like Brain-CLIPLM text protocol."""
     try:
         with open(path, "r", encoding="utf-8-sig", newline="") as f:
             reader = csv.DictReader(f)
@@ -28,11 +23,7 @@ def _is_l2_text_csv(path: Path) -> bool:
 
 
 def find_eeg_root(root: str | Path) -> Optional[Path]:
-    """Find the directory containing SEED-VII subject files 1-20.mat.
-
-    Works when the .mat files are directly in the dataset root, or under
-    EEG_preprocessed/, or any nested folder.
-    """
+    """Find the directory containing SEED-VII subject files 1-20.mat."""
     root = Path(root)
     if not root.exists():
         return None
@@ -42,24 +33,15 @@ def find_eeg_root(root: str | Path) -> Optional[Path]:
     counts = {}
     for p in mat_files:
         counts[p.parent] = counts.get(p.parent, 0) + 1
-    # Prefer a directory that has the most subject mats; require at least one.
     return max(counts, key=counts.get)
 
 
 def find_text_protocol_csv(root: str | Path) -> Optional[Path]:
-    """Find the user's L2 text protocol CSV.
-
-    Search order:
-      1) root/text_protocol*.csv
-      2) any nested text_protocol*.csv
-      3) root/*.csv that has trial + l2_text-like columns
-      4) any nested *.csv that has trial + l2_text-like columns
-    """
+    """Find the user's L2 text protocol CSV."""
     root = Path(root)
     if not root.exists():
         return None
 
-    # Root first, because the user's files are in dataset root.
     cands = sorted(root.glob("text_protocol*.csv"))
     for p in cands:
         if _is_l2_text_csv(p):

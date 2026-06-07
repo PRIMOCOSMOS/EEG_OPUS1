@@ -8,13 +8,12 @@ runtime:
 data:
   modelscope_dataset_id: DEREKVERSE/SEED-VII
   local_dataset_dir: /mnt/workspace/seedvii_ms_dataset
-  # In the current ModelScope dataset, 1-20.mat and text_protocol.csv are in the dataset root.
   eeg_root: /mnt/workspace/seedvii_ms_dataset
   text_csv_path: /mnt/workspace/seedvii_ms_dataset/text_protocol.csv
   npz_dir: /mnt/workspace/seedvii_npz
   fs: 200
   window_sec: 4.0
-  stride_sec: 4.0      # non-overlap windows as requested
+  stride_sec: 4.0
   center_ratio: 0.60
   max_windows_per_clip: 12
   shard_size: 512
@@ -33,10 +32,6 @@ model:
     kernel_length: 64
     dropout: 0.25
   llm:
-    # Recommended to set this to a local path downloaded by modelscope.snapshot_download in the notebook.
-    # model_name_or_path may be an actual local snapshot dir. If this guessed path
-    # does not exist, train_contrastive.py will search under its parent or download
-    # modelscope_model_id automatically.
     model_name_or_path: /mnt/workspace/models/Qwen2.5-0.5B-Instruct
     modelscope_model_id: Qwen/Qwen2.5-0.5B-Instruct
     max_length: 64

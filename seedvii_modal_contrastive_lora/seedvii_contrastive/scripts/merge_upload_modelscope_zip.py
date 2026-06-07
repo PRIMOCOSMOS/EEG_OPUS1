@@ -1,8 +1,5 @@
 from __future__ import annotations
 
-# Allow running this file directly, e.g.
-#   python seedvii_contrastive/scripts/xxx.py
-# without requiring `pip install -e .` or setting PYTHONPATH.
 import sys
 from pathlib import Path
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -10,7 +7,6 @@ if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
 import argparse
-from pathlib import Path
 import re
 import shutil
 import os
@@ -25,7 +21,7 @@ def main():
     ap.add_argument("--parts-dir", required=True)
     ap.add_argument("--pattern", default="*.zip.*")
     ap.add_argument("--output-zip", required=True)
-    ap.add_argument("--delete-parts-after-copy", action="store_true", help="Only use if parts are writable; saves disk during merge")
+    ap.add_argument("--delete-parts-after-copy", action="store_true")
     ap.add_argument("--upload", action="store_true")
     ap.add_argument("--dataset-id", default="DEREKVERSE/SEED-VII")
     ap.add_argument("--path-in-repo", default="EEG_preprocessed.zip")
@@ -39,13 +35,11 @@ def main():
     out = Path(args.output_zip); out.parent.mkdir(parents=True, exist_ok=True)
     free = shutil.disk_usage(out.parent).free
     if free < total * 1.05 and not args.delete_parts_after_copy:
-        print(f"[WARN] free space {free/1e9:.1f}GB < merged size {total/1e9:.1f}GB. "
-              "On a 100GB persistent disk this will fail for a 160GB zip. "
-              "Use a larger ephemeral path, mounted dataset file, or --delete-parts-after-copy if parts are writable.")
+        print(f"[WARN] free space {free/1e9:.1f}GB < merged size {total/1e9:.1f}GB.")
     print(f"merging {len(parts)} parts -> {out} ({total/1e9:.2f} GB)")
     with open(out, "wb") as dst:
         for p in parts:
-            print("  +", p.name)
+            print(" +", p.name)
             with open(p, "rb") as src:
                 shutil.copyfileobj(src, dst, length=1024 * 1024 * 64)
             if args.delete_parts_after_copy:

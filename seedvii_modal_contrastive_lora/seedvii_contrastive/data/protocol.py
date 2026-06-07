@@ -39,7 +39,7 @@ FINE_TO_VALENCE = {
     "surprise": "positive",
 }
 
-# Design.md session protocol: 4 sessions × 20 trials, 4 folds × 5 trials.
+# Design.md session protocol: 4 sessions x 20 trials, 4 folds x 5 trials.
 SESSION_SEQUENCES = {
     1: [
         ["H", "N", "D", "S", "A"],
@@ -67,7 +67,6 @@ SESSION_SEQUENCES = {
     ],
 }
 
-
 def build_trial_fine_emotions() -> Dict[int, str]:
     """Return {trial_id 1..80: fine_emotion_name}."""
     out: Dict[int, str] = {}
@@ -80,6 +79,7 @@ def build_trial_fine_emotions() -> Dict[int, str]:
                 out[trial_id] = CODE_TO_FINE[code]
     assert len(out) == 80
     return out
+
 
 TRIAL_FINE = build_trial_fine_emotions()
 
@@ -102,16 +102,7 @@ def _extract_trial_id(raw: str) -> Optional[int]:
 
 
 def load_l2_text_protocol(csv_path: str | Path) -> Dict[int, str]:
-    """Load Brain-CLIPLM-style text_protocol.csv and return {trial_id: l2_text}.
-
-    Expected protocol columns are compatible with the reference repo:
-      emotion,l1_text,trial,l2_text
-    Only l2_text is used as LLM Tower input. Emotion labels for positives/negatives
-    still come from the SEED-VII session protocol and three-class aggregation.
-
-    The loader is tolerant to common aliases: video_id/id for trial, text/sentence
-    for l2_text.
-    """
+    """Load Brain-CLIPLM-style text_protocol.csv and return {trial_id: l2_text}."""
     path = Path(csv_path)
     if not path.exists():
         raise FileNotFoundError(f"text protocol CSV not found: {path}")
@@ -125,7 +116,8 @@ def load_l2_text_protocol(csv_path: str | Path) -> Dict[int, str]:
         text_col = lower.get("l2_text") or lower.get("text") or lower.get("sentence") or lower.get("description")
         if not trial_col or not text_col:
             raise ValueError(
-                f"{path} must contain trial/video_id and l2_text/text columns; got {reader.fieldnames}")
+                f"{path} must contain trial/video_id and l2_text/text columns; got {reader.fieldnames}"
+            )
         for row in reader:
             tid = _extract_trial_id(row.get(trial_col, ""))
             txt = (row.get(text_col) or "").strip()
@@ -139,11 +131,7 @@ def load_l2_text_protocol(csv_path: str | Path) -> Dict[int, str]:
 
 
 def write_label_protocol_csvs(out_dir: str | Path) -> None:
-    """Write label-only protocol files for reproducibility.
-
-    This does NOT generate L2 supervision text. L2 text must come from the user's
-    carefully designed Brain-CLIPLM-style text_protocol.csv.
-    """
+    """Write label-only protocol files for reproducibility."""
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
     with open(out / "videoid_to_emotion.csv", "w", newline="", encoding="utf-8") as f:

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 # Allow running this file directly, e.g.
-#   python seedvii_contrastive/scripts/xxx.py
+# python seedvii_contrastive/scripts/xxx.py
 # without requiring `pip install -e .` or setting PYTHONPATH.
 import sys
 from pathlib import Path
@@ -47,21 +47,12 @@ def _looks_like_transformers_model_dir(path: Path) -> bool:
 
 
 def _find_local_llm_dir(base: Path, preferred_name: str = "") -> Path | None:
-    """Find an actual Transformers model directory under a ModelScope cache/local dir.
-
-    ModelScope snapshot_download may return a nested snapshot path, while notebooks
-    often store a guessed path such as /mnt/workspace/models/Qwen2.5-0.5B-Instruct.
-    If that guessed path does not exist, Transformers treats it as a Hub repo id
-    and raises HFValidationError. This helper searches for a real directory that
-    contains config.json.
-    """
+    """Find an actual Transformers model directory under a ModelScope cache/local dir."""
     if not base.exists():
         return None
     candidates = [p.parent for p in base.rglob("config.json") if p.is_file()]
     if not candidates:
         return None
-    # Prefer dirs containing the requested model basename, otherwise choose the
-    # shortest path (usually the snapshot root rather than a nested subdir).
     preferred_name = preferred_name.lower()
     if preferred_name:
         hits = [c for c in candidates if preferred_name in str(c).lower()]
@@ -71,12 +62,7 @@ def _find_local_llm_dir(base: Path, preferred_name: str = "") -> Path | None:
 
 
 def resolve_llm_model_path(llm_cfg: dict) -> str:
-    """Resolve local/ModelScope LLM path robustly.
-
-    If model_name_or_path is an existing local directory, use it. If it is a
-    non-existing absolute path, search its parent; if still missing, download the
-    ModelScope model id specified by `modelscope_model_id`.
-    """
+    """Resolve local/ModelScope LLM path robustly."""
     raw = str(llm_cfg["model_name_or_path"])
     p = Path(raw).expanduser()
     if _looks_like_transformers_model_dir(p):
@@ -93,23 +79,22 @@ def resolve_llm_model_path(llm_cfg: dict) -> str:
                 print(f"[LLM Tower] resolved local model path: {raw} -> {found}")
                 return str(found)
 
-        model_id = llm_cfg.get("modelscope_model_id") or llm_cfg.get("hf_model_id") or "Qwen/Qwen2.5-0.5B-Instruct"
-        cache_dir = str(p.parent if p.parent != Path("") else Path("/mnt/workspace/models"))
-        print(f"[LLM Tower][WARN] local model path does not exist or lacks config.json: {raw}")
-        print(f"[LLM Tower] downloading ModelScope model {model_id} to cache_dir={cache_dir}")
-        try:
-            from modelscope import snapshot_download
-            model_dir = snapshot_download(model_id, cache_dir=cache_dir)
-            print(f"[LLM Tower] downloaded/resolved model_dir={model_dir}")
-            return str(model_dir)
-        except Exception as e:
-            raise FileNotFoundError(
-                f"Cannot resolve local LLM path {raw!r}, and ModelScope download of {model_id!r} failed: {e}. "
-                f"Fix config model.llm.model_name_or_path to the actual snapshot_download return path, "
-                f"or set model.llm.modelscope_model_id."
-            ) from e
+    model_id = llm_cfg.get("modelscope_model_id") or llm_cfg.get("hf_model_id") or "Qwen/Qwen2.5-0.5B-Instruct"
+    cache_dir = str(p.parent if p.parent != Path("") else Path("/mnt/workspace/models"))
+    print(f"[LLM Tower][WARN] local model path does not exist or lacks config.json: {raw}")
+    print(f"[LLM Tower] downloading ModelScope model {model_id} to cache_dir={cache_dir}")
+    try:
+        from modelscope import snapshot_download
+        model_dir = snapshot_download(model_id, cache_dir=cache_dir)
+        print(f"[LLM Tower] downloaded/resolved model_dir={model_dir}")
+        return str(model_dir)
+    except Exception as e:
+        raise FileNotFoundError(
+            f"Cannot resolve local LLM path {raw!r}, and ModelScope download of {model_id!r} failed: {e}. "
+            f"Fix config model.llm.model_name_or_path to the actual snapshot_download return path, "
+            f"or set model.llm.modelscope_model_id."
+        ) from e
 
-    # Non-local string such as 'Qwen/Qwen2.5-0.5B-Instruct'. Let transformers handle it.
     return raw
 
 
@@ -144,15 +129,10 @@ def build_optimizer(cfg, eeg, text):
 
 @torch.no_grad()
 def evaluate(eeg, text, loader, device, text_csv_path):
-    """Classify EEG by nearest aggregated class prototype in L2-text embedding space.
-
-    The text tower is fed only the user's L2 trial descriptions from text_protocol.csv.
-    Three class prototypes are the mean normalized embeddings of the 80 L2 descriptions
-    grouped by aggregated valence label.
-    """
+    """Classify EEG by nearest aggregated class prototype in L2-text embedding space."""
     eeg.eval(); text.eval()
     bank_texts, bank_labels, _ = build_l2_text_bank(text_csv_path)
-    bank_z = text(bank_texts)  # (80,d)
+    bank_z = text(bank_texts)
     protos = []
     for c in range(3):
         idx = torch.tensor(bank_labels == c, dtype=torch.bool, device=bank_z.device)
@@ -209,118 +189,141 @@ def main():
     if args.output_dir:
         cfg["runtime"]["output_dir"] = args.output_dir
 
-    # Robust path discovery: the user's ModelScope dataset stores 1-20.mat and
-    # protocol CSV directly in the dataset root. If configured text/eeg paths are
-    # stale (e.g. expecting EEG_preprocessed/), rediscover from local_dataset_dir.
-    dcfg = cfg.get("data", {})
-    roots_to_try = []
-    for key in ("local_dataset_dir", "eeg_root"):
-        if dcfg.get(key):
-            roots_to_try.append(Path(dcfg[key]))
-    if dcfg.get("npz_dir"):
-        roots_to_try.append(Path(dcfg["npz_dir"]).parent)
-    for r in roots_to_try:
-        if not r.exists():
-            continue
-        eeg_root, text_csv = discover_seedvii_paths(r)
-        if eeg_root is not None and (not dcfg.get("eeg_root") or not Path(dcfg["eeg_root"]).exists()):
-            cfg["data"]["eeg_root"] = str(eeg_root)
-        if text_csv is not None and (not dcfg.get("text_csv_path") or not Path(dcfg["text_csv_path"]).exists()):
-            cfg["data"]["text_csv_path"] = str(text_csv)
-        if cfg["data"].get("text_csv_path") and Path(cfg["data"]["text_csv_path"]).exists():
-            break
-    if not cfg["data"].get("text_csv_path") or not Path(cfg["data"]["text_csv_path"]).exists():
-        raise FileNotFoundError("Cannot find L2 text protocol CSV. Put text_protocol.csv in dataset root or set data.text_csv_path.")
+    # Robust path discovery
+    dcfg = cfg["data"]
+    if dcfg.get("local_dataset_dir"):
+        auto_root = Path(dcfg["local_dataset_dir"])
+        eeg_root, text_csv = discover_seedvii_paths(auto_root)
+        if eeg_root is not None:
+            dcfg["eeg_root"] = str(eeg_root)
+        if text_csv is not None:
+            dcfg["text_csv_path"] = str(text_csv)
 
     set_seed(cfg.get("seed", 42))
     device = resolve_device(cfg["runtime"].get("device", "auto"))
-    out_dir = Path(cfg["runtime"]["output_dir"]); out_dir.mkdir(parents=True, exist_ok=True)
-    save_json(cfg, out_dir / "config.resolved.json")
+    print(f"[Train] device={device}")
+    out_dir = Path(cfg["runtime"]["output_dir"])
+    out_dir.mkdir(parents=True, exist_ok=True)
 
-    df = load_index(cfg["data"]["npz_dir"])
-    tr_df, va_df = split_index_by_subjects(df, cfg["data"]["train_subjects"], cfg["data"]["val_subjects"])
-    print(f"[{now()}] train windows={len(tr_df)} val windows={len(va_df)}")
-    print("train class counts:", tr_df.label3.value_counts().sort_index().to_dict())
-    print("val class counts:", va_df.label3.value_counts().sort_index().to_dict())
+    # Dataset
+    df = load_index(dcfg["npz_dir"])
+    tr_df, va_df = split_index_by_subjects(df, dcfg["train_subjects"], dcfg["val_subjects"])
+    print(f"train windows={len(tr_df)} val windows={len(va_df)}")
 
-    stats_path = out_dir / "norm_stats.npz"
-    if stats_path.exists():
-        z = np.load(stats_path); mean, std = z["mean"], z["std"]
-        print("loaded norm stats", stats_path)
+    tr_labels = tr_df["label3"].tolist()
+    from collections import Counter
+    print("train class counts:", dict(sorted(Counter(tr_labels).items())))
+    va_labels = va_df["label3"].tolist()
+    print("val class counts:", dict(sorted(Counter(va_labels).items())))
+
+    # Normalization stats
+    norm_stats_path = out_dir / "norm_stats.npz"
+    if norm_stats_path.exists():
+        print(f"loaded norm stats {norm_stats_path}")
+        stats = dict(np.load(norm_stats_path))
     else:
-        print("fitting channel stats on training subjects only...")
-        mean, std = fit_channel_stats(tr_df)
-        np.savez(stats_path, mean=mean, std=std)
+        print("fitting channel stats from train shards...")
+        mean, std = fit_channel_stats(tr_df, max_shards=0)
+        np.savez_compressed(norm_stats_path, mean=mean, std=std)
+        stats = {"mean": mean, "std": std}
 
-    text_csv_path = cfg["data"]["text_csv_path"]
-    tr_ds = WindowNpzDataset(tr_df, mean, std, text_csv_path=text_csv_path, cache_size=cfg["data"].get("cache_size", 8))
-    va_ds = WindowNpzDataset(va_df, mean, std, text_csv_path=text_csv_path, cache_size=cfg["data"].get("cache_size", 8))
-    sampler = ClassBalancedBatchSampler(
-        tr_df.label3.tolist(), batch_size=cfg["train"]["batch_size"],
-        steps_per_epoch=cfg["train"].get("steps_per_epoch"), seed=cfg.get("seed", 42))
-    tr_loader = DataLoader(tr_ds, batch_sampler=sampler, num_workers=cfg["train"].get("num_workers", 2), collate_fn=collate)
-    va_loader = DataLoader(va_ds, batch_size=cfg["train"]["batch_size"], shuffle=False,
-                           num_workers=cfg["train"].get("num_workers", 2), collate_fn=collate)
+    # Datasets
+    train_ds = WindowNpzDataset(tr_df, stats["mean"], stats["std"],
+                                 text_csv_path=dcfg["text_csv_path"],
+                                 cache_size=dcfg.get("cache_size", 8))
+    val_ds = WindowNpzDataset(va_df, stats["mean"], stats["std"],
+                               text_csv_path=dcfg["text_csv_path"],
+                               cache_size=dcfg.get("cache_size", 8))
 
+    # Balanced batch sampler
+    tcfg = cfg["train"]
+    train_sampler = ClassBalancedBatchSampler(
+        train_ds.df["label3"].tolist(),
+        batch_size=tcfg["batch_size"],
+        steps_per_epoch=tcfg.get("steps_per_epoch", None),
+        seed=cfg.get("seed", 42),
+    )
+    val_loader = DataLoader(
+        val_ds, batch_size=tcfg["batch_size"],
+        shuffle=False, num_workers=tcfg.get("num_workers", 2),
+        collate_fn=collate,
+    )
+
+    # Model
     eeg, text = build_models(cfg, device)
+
+    # Optimizer
     opt = build_optimizer(cfg, eeg, text)
-    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=max(1, cfg["train"]["epochs"]), eta_min=1e-5)
-    crit = TriContrastiveLoss(**cfg["loss"]).to(device)
+    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=tcfg["epochs"])
 
-    start_epoch = 0; global_step = 0; best = -1.0
-    last_path = out_dir / "last.pt"; best_path = out_dir / "best.pt"
-    if cfg["train"].get("resume", True) and last_path.exists():
-        print("resuming from", last_path)
-        sd = load_ckpt(last_path, eeg, text, opt, sched, device)
-        start_epoch = int(sd.get("epoch", -1)) + 1
-        global_step = int(sd.get("step", 0)); best = float(sd.get("best_metric", -1.0))
+    # Loss
+    lcfg = cfg["loss"]
+    criterion = TriContrastiveLoss(
+        temperature=lcfg.get("temperature", 0.07),
+        beta_eeg=lcfg.get("beta_eeg", 0.65),
+        beta_llm=lcfg.get("beta_llm", 0.35),
+    )
 
-    log_path = out_dir / "train_log.csv"
-    if not log_path.exists():
-        with open(log_path, "w", newline="", encoding="utf-8") as f:
-            csv.writer(f).writerow(["time", "epoch", "step", "loss", "inter", "eeg_intra", "llm_intra", "val_acc", "val_macro_f1"])
+    # Resume checkpoint
+    start_epoch, step, best_metric = 0, 0, 0.0
+    ckpt_path = out_dir / "last.pt"
+    if tcfg.get("resume", True) and ckpt_path.exists():
+        sd = load_ckpt(ckpt_path, eeg, text, opt, sched, device)
+        start_epoch = sd.get("epoch", 0)
+        step = sd.get("step", 0)
+        best_metric = sd.get("best_metric", 0.0)
+        print(f"[Train] resumed epoch={start_epoch} step={step} best_metric={best_metric:.4f}")
 
-    start_time = time.time(); last_save = time.time()
-    max_seconds = cfg["runtime"].get("max_hours", 9.5) * 3600
-    save_every = cfg["runtime"].get("save_every_minutes", 30) * 60
-
-    for epoch in range(start_epoch, cfg["train"]["epochs"]):
-        sampler.set_epoch(epoch)
+    # Training loop
+    print(f"[Train] epochs={tcfg['epochs']} steps_per_epoch={len(train_sampler)}")
+    for epoch in range(start_epoch, tcfg["epochs"]):
+        train_sampler.set_epoch(epoch)
         eeg.train(); text.train()
-        pbar = tqdm(tr_loader, desc=f"epoch {epoch}")
-        running = []
-        for batch in pbar:
-            x = batch["eeg"].to(device, non_blocking=True)
-            y = batch["label"].to(device, non_blocking=True)
-            eeg_z = eeg(x)
-            txt_z = text(batch["text"])
-            losses = crit(eeg_z, txt_z, y)
-            loss = losses["loss"]
-            opt.zero_grad(set_to_none=True)
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(list(eeg.parameters()) + [p for p in text.parameters() if p.requires_grad], 1.0)
-            opt.step()
-            global_step += 1
-            running.append(float(loss.item()))
-            pbar.set_postfix(loss=np.mean(running[-20:]), inter=float(losses["inter"]), eeg=float(losses["eeg_intra"]), llm=float(losses["llm_intra"]))
+        pbar = tqdm(train_sampler, desc=f"epoch {epoch}", leave=False)
+        epoch_losses = []
 
-            if time.time() - last_save > save_every:
-                save_ckpt(last_path, eeg, text, opt, sched, epoch, global_step, best, cfg)
-                last_save = time.time()
-            if time.time() - start_time > max_seconds:
-                print("time budget reached; saving and exiting safely")
-                save_ckpt(last_path, eeg, text, opt, sched, epoch, global_step, best, cfg)
-                return
+        for batch_idx, indices in enumerate(pbar):
+            batch = [train_ds[i] for i in indices]
+            batch = collate(batch)
+
+            x = batch["eeg"].to(device)
+            y = batch["label"].to(device)
+            texts = batch["text"]
+
+            eeg_z = eeg(x)
+            text_z = text(texts)
+
+            loss_dict = criterion(eeg_z, text_z, y)
+            loss = loss_dict["loss"]
+
+            opt.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(list(eeg.parameters()) + list(text.parameters()), max_norm=1.0)
+            opt.step()
+
+            epoch_losses.append(loss.item())
+            pbar.set_postfix({
+                "loss": f"{loss.item():.4f}",
+                "inter": f"{loss_dict['inter'].item():.4f}",
+                "eeg_intra": f"{loss_dict['eeg_intra'].item():.4f}",
+                "llm_intra": f"{loss_dict['llm_intra'].item():.4f}",
+            })
+            step += 1
+
         sched.step()
-        val = evaluate(eeg, text, va_loader, device, cfg["data"]["text_csv_path"] )
-        metric = val["macro_f1"]
-        if metric > best:
-            best = metric
-            save_ckpt(best_path, eeg, text, opt, sched, epoch, global_step, best, cfg)
-        save_ckpt(last_path, eeg, text, opt, sched, epoch, global_step, best, cfg)
-        with open(log_path, "a", newline="", encoding="utf-8") as f:
-            csv.writer(f).writerow([now(), epoch, global_step, np.mean(running), "", "", "", val["acc"], val["macro_f1"]])
-        print(f"[{now()}] epoch={epoch} val={val} best_macro_f1={best:.4f}")
+
+        metrics = evaluate(eeg, text, val_loader, device, dcfg["text_csv_path"])
+        avg_loss = sum(epoch_losses) / len(epoch_losses)
+        print(f"epoch {epoch}: avg_loss={avg_loss:.4f} val_acc={metrics['acc']:.4f} val_f1={metrics['macro_f1']:.4f}")
+
+        if metrics["macro_f1"] >= best_metric:
+            best_metric = metrics["macro_f1"]
+            save_ckpt(out_dir / "best.pt", eeg, text, opt, sched, epoch, step, best_metric, cfg)
+            print(f"[Train] saved best model (f1={best_metric:.4f})")
+
+        save_ckpt(ckpt_path, eeg, text, opt, sched, epoch, step, best_metric, cfg)
+
+    print(f"[Train] done. best_metric={best_metric:.4f}")
 
 
 if __name__ == "__main__":

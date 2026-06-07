@@ -43,16 +43,14 @@ def sniff_mat_file(path: str | Path, n: int = 512) -> dict:
         info["kind"] = "zip_archive"
     elif head.lstrip().lower().startswith((b"<!doctype html", b"<html")):
         info["kind"] = "html_or_error_page"
-    elif info["size"] == 0:
-        info["kind"] = "empty"
     else:
         info["kind"] = "unknown"
     return info
 
 
-def _format_head(head: bytes, max_len: int = 160) -> str:
+def _format_head(head: bytes, max_len: int = 64) -> str:
     if not head:
-        return "<empty>"
+        return ""
     shown = head[:max_len]
     try:
         txt = shown.decode("utf-8", errors="replace")
@@ -72,13 +70,13 @@ def explain_bad_mat_file(path: str | Path) -> str:
     ]
     kind = info["kind"]
     if kind == "git_lfs_pointer":
-        msg.append("This is a Git-LFS pointer, not the real EEG .mat payload. Download with ModelScope dataset/LFS support, not raw git text.")
+        msg.append("This is a Git-LFS pointer, not the real EEG .mat payload. Download with ModelScope dataset/LFS support.")
     elif kind == "html_or_error_page":
         msg.append("This looks like an HTML/error page, often caused by an authentication or wrong URL download.")
     elif kind == "zip_archive":
-        msg.append("This is a ZIP archive. Extract it first or point --input-root to the extracted folder containing 1-20.mat.")
+        msg.append("This is a ZIP archive. Extract it first.")
     elif kind == "unknown":
-        msg.append("Expected either HDF5 MATLAB v7.3 signature or MATLAB 5/v7 classic header. Please verify the ModelScope file was fully downloaded.")
+        msg.append("Expected either HDF5 MATLAB v7.3 signature or MATLAB 5/v7 classic header.")
     return "\n".join(msg)
 
 
@@ -95,15 +93,8 @@ def _normalize_trial_array(arr: np.ndarray, trial_id: int, mat_path: str | Path,
 
 
 class SubjectMatReader:
-    """Read one SEED-VII subject .mat robustly.
+    """Read one SEED-VII subject .mat robustly."""
 
-    Supports:
-      - MATLAB v7.3 HDF5 files: opens h5py.File once and reads each trial lazily.
-      - MATLAB v5/v7 classic files: loads once with scipy.io.loadmat.
-
-    If the file is a Git-LFS pointer, HTML page, ZIP, or truncated download, the
-    raised error includes the file signature and likely fix.
-    """
     def __init__(self, mat_path: str | Path, n_channels: int = 62):
         self.mat_path = Path(mat_path)
         self.n_channels = n_channels

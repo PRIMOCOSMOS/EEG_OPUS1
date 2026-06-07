@@ -35,13 +35,13 @@ def fit_channel_stats(df: pd.DataFrame, max_shards: int = 0) -> tuple[np.ndarray
     sums = None; sqs = None; count = 0
     for p in shards:
         with np.load(p) as z:
-            x = z["x"].astype(np.float64)  # (N,C,T)
-        s = x.sum(axis=(0, 2))
-        q = (x * x).sum(axis=(0, 2))
-        n = x.shape[0] * x.shape[2]
-        sums = s if sums is None else sums + s
-        sqs = q if sqs is None else sqs + q
-        count += n
+            x = z["x"].astype(np.float64)
+            s = x.sum(axis=(0, 2))
+            q = (x * x).sum(axis=(0, 2))
+            n = x.shape[0] * x.shape[2]
+            sums = s if sums is None else sums + s
+            sqs = q if sqs is None else sqs + q
+            count += n
     mean = sums / max(count, 1)
     var = np.maximum(sqs / max(count, 1) - mean * mean, 1e-8)
     std = np.sqrt(var)
@@ -81,13 +81,13 @@ class WindowNpzDataset(Dataset):
     def __getitem__(self, i: int) -> dict:
         row = self.df.iloc[i]
         shard = self._load_shard(row.abs_shard)
-        x = shard["x"][int(row.idx)].astype(np.float32)  # (62,T)
+        x = shard["x"][int(row.idx)].astype(np.float32)
         x = (x - self.mean) / (self.std + 1e-6)
         y = int(row.label3)
         tid = int(row.trial)
-        text = self.text_by_trial[tid]  # L2 text only, exactly from protocol CSV.
+        text = self.text_by_trial[tid]
         return {
-            "eeg": torch.from_numpy(x).unsqueeze(0),  # (1,62,T)
+            "eeg": torch.from_numpy(x).unsqueeze(0),
             "label": torch.tensor(y, dtype=torch.long),
             "text": text,
             "subject": int(row.subject),
@@ -96,11 +96,8 @@ class WindowNpzDataset(Dataset):
 
 
 class ClassBalancedBatchSampler(Sampler[List[int]]):
-    """Batch sampler that draws approximately equal samples per class with replacement.
+    """Batch sampler that draws approximately equal samples per class with replacement."""
 
-    This is useful for supervised contrastive losses because each batch should contain
-    positives for all three classes.
-    """
     def __init__(self, labels: Iterable[int], batch_size: int, steps_per_epoch: Optional[int] = None, seed: int = 42):
         self.labels = np.asarray(list(labels), dtype=np.int64)
         self.batch_size = int(batch_size)

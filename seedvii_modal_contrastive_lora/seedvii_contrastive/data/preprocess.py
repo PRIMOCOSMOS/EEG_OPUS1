@@ -51,8 +51,8 @@ class ShardWriter:
         for i in range(len(x)):
             self.buf_x.append(x[i])
             self.buf_meta.append(metas[i])
-            if len(self.buf_x) >= self.shard_size:
-                self.flush()
+        if len(self.buf_x) >= self.shard_size:
+            self.flush()
 
     def flush(self):
         if not self.buf_x:
@@ -95,13 +95,7 @@ def preprocess_to_npz(
     shard_size: int = 512,
     tmp_dir: Optional[str | Path] = None,
 ) -> Path:
-    """Preprocess SEED-VII EEG_preprocessed H5 .mat files to window-level NPZ shards.
-
-    This extracts/opens one subject at a time, crops the middle 60%, cuts 4s windows,
-    optionally caps each clip to a fixed number of windows, and writes small .npz shards.
-    No train/test statistics are fitted here; normalization is fitted later on training
-    subjects only to avoid preprocessing leakage.
-    """
+    """Preprocess SEED-VII EEG_preprocessed H5 .mat files to window-level NPZ shards."""
     if not input_root and not zip_path:
         raise ValueError("provide either input_root or zip_path")
     subjects = subjects or list(range(1, 21))
@@ -130,7 +124,7 @@ def preprocess_to_npz(
                 if missing_keys:
                     raise KeyError(f"{mat_path} is missing trial keys: {missing_keys[:20]}{'...' if len(missing_keys)>20 else ''}")
                 for tid in tqdm(range(1, 81), desc=f"S{sid:02d} trials", leave=False):
-                    arr = reader.read_trial(tid)  # (62, N)
+                    arr = reader.read_trial(tid)
                     cropped, crop_start = center_crop_signal(arr, center_ratio=center_ratio)
                     windows, starts = make_windows(cropped, fs=fs, window_sec=window_sec, stride_sec=stride_sec)
                     windows, starts = choose_fixed_windows(windows, starts, max_windows_per_clip, seed=sid * 1000 + tid)
@@ -155,6 +149,5 @@ def preprocess_to_npz(
             json.dump(summary, f, ensure_ascii=False, indent=2)
         return index_path
     finally:
-        # Only remove temp dir if we created it implicitly.
         if tmp_dir is None:
             shutil.rmtree(tmp_base, ignore_errors=True)

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-# Allow running directly without pip install -e .
 import sys
 from pathlib import Path
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -41,12 +40,12 @@ def main():
         try:
             with SubjectMatReader(p) as r:
                 keys = r.trial_keys()
-                print(f"  trial_keys_count={len(keys)} first={keys[:5]} last={keys[-5:] if keys else []}")
+                print(f" trial_keys_count={len(keys)} first={keys[:5]} last={keys[-5:] if keys else []}")
                 if args.read_first_trial:
                     arr = r.read_trial(1)
-                    print(f"  trial1_shape={arr.shape} dtype={arr.dtype} min={arr.min():.4g} max={arr.max():.4g}")
+                    print(f" trial1_shape={arr.shape} dtype={arr.dtype} min={arr.min():.4g} max={arr.max():.4g}")
         except Exception as e:
-            print(f"  ERROR: {type(e).__name__}: {e}")
+            print(f" ERROR: {type(e).__name__}: {e}")
 
 
 if __name__ == "__main__":

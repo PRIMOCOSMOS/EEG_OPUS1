@@ -11,6 +11,7 @@ class EEGNetEncoder(nn.Module):
     Input shape: (B, 1, 62, T), T=800 for 4s@200Hz.
     Output: L2-normalized embedding of shape (B, embed_dim).
     """
+
     def __init__(
         self,
         chans: int = 62,
@@ -59,6 +60,7 @@ class EEGNetEncoder(nn.Module):
 
 class EEGNetClassifier(nn.Module):
     """Optional classifier wrapper for probing. The contrastive trainer uses EEGNetEncoder."""
+
     def __init__(self, encoder: EEGNetEncoder, embed_dim: int = 128, num_classes: int = 3):
         super().__init__()
         self.encoder = encoder

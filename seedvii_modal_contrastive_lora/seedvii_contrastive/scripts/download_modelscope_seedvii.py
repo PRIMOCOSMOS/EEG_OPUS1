@@ -1,12 +1,21 @@
 from __future__ import annotations
 
+# Allow running this file directly, e.g.
+#   python seedvii_contrastive/scripts/download_modelscope_seedvii.py
+# without requiring `pip install -e .` or setting PYTHONPATH.
+import sys
+from pathlib import Path
+_PROJECT_ROOT = Path(__file__).resolve().parents[2]
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_ROOT))
+
 import argparse
 import fnmatch
 import os
-from pathlib import Path
+import subprocess
 from typing import List
 
-from seedvii_contrastive.data.discovery import discover_seedvii_paths
+from seedvii_contrastive.data.discovery import discover_seedvii_paths, SUBJECT_FILE_NAMES
 
 
 def _file_path(entry: dict) -> str:
@@ -14,7 +23,11 @@ def _file_path(entry: dict) -> str:
 
 
 def list_dataset_files(dataset_id: str, revision: str = "master", token: str | None = None) -> List[str]:
-    """List ModelScope dataset files using the dataset Hub API, not model protocol."""
+    """List ModelScope dataset files using the dataset Hub API, not model protocol.
+
+    Some ModelScope SDK versions differ, so this function is best-effort. The main
+    download flow can fall back to direct dataset_snapshot_download with patterns.
+    """
     from modelscope.hub.api import HubApi
     api = HubApi(token=token)
     endpoint = api.get_endpoint_for_read(repo_id=dataset_id, repo_type="dataset", token=token)
@@ -48,29 +61,39 @@ def list_dataset_files(dataset_id: str, revision: str = "master", token: str | N
     return sorted(set(out))
 
 
-def select_seedvii_files(files: List[str]) -> List[str]:
-    """Select 1-20.mat plus Brain-CLIPLM-style text protocol CSV.
+def default_allow_patterns() -> List[str]:
+    """Patterns that cover root-level and one/multi-level nested layouts."""
+    pats: List[str] = []
+    for i in range(1, 21):
+        for name in (f"{i}.mat", f"{i:02d}.mat"):
+            pats.extend([name, f"*/{name}", f"*/*/{name}", f"**/{name}"])
+    # CSVs are small; download all so root text_protocol.csv is never missed.
+    pats.extend(["*.csv", "*/*.csv", "*/*/*.csv", "**/*.csv"])
+    return pats
 
-    The true EEG_preprocessed subject files are HDF5 MATLAB files named 1.mat ... 20.mat.
-    We intentionally exclude zip / split-volume files here.
+
+def select_seedvii_files(files: List[str]) -> List[str]:
+    """Select 1-20.mat plus all CSVs.
+
+    The user's actual layout keeps 1-20.mat and protocol CSV directly in the dataset
+    root. We also support nested layouts.
     """
     selected = []
-    subject_names = {f"{i}.mat" for i in range(1, 21)} | {f"{i:02d}.mat" for i in range(1, 21)}
     for p in files:
         base = Path(p).name
         low = p.lower()
-        if base in subject_names:
+        if base in SUBJECT_FILE_NAMES:
             selected.append(p)
         elif low.endswith(".csv"):
-            # Protocol CSVs are small and may live directly in the dataset root
-            # with names such as text_protocol.csv / videoid_to_emotion.csv.
-            # Download all CSVs to avoid missing the user's L2 protocol.
             selected.append(p)
     return sorted(set(selected))
 
 
-def dataset_download(dataset_id: str, local_dir: str, allow_patterns: List[str], revision: str = "master", token: str | None = None, max_workers: int = 4) -> str:
+def dataset_snapshot_download_compat(dataset_id: str, local_dir: str, allow_patterns: List[str],
+                                     revision: str = "master", token: str | None = None,
+                                     max_workers: int = 4) -> str:
     """Download selected dataset files via ModelScope dataset snapshot API."""
+    last_err = None
     try:
         from modelscope.hub.snapshot_download import dataset_snapshot_download
         return dataset_snapshot_download(
@@ -81,61 +104,120 @@ def dataset_download(dataset_id: str, local_dir: str, allow_patterns: List[str],
             token=token,
             max_workers=max_workers,
         )
-    except Exception as e1:
-        # Compatibility with SDK versions exposing only snapshot_download.
-        try:
-            from modelscope import snapshot_download
-            return snapshot_download(
-                repo_id=dataset_id,
-                repo_type="dataset",
-                revision=revision,
-                local_dir=local_dir,
-                allow_patterns=allow_patterns,
-                token=token,
-                max_workers=max_workers,
-            )
-        except Exception as e2:
-            raise RuntimeError(f"dataset download failed. dataset_snapshot_download error={e1}; snapshot_download error={e2}")
+    except Exception as e:
+        last_err = e
+
+    try:
+        from modelscope import snapshot_download
+        return snapshot_download(
+            repo_id=dataset_id,
+            repo_type="dataset",
+            revision=revision,
+            local_dir=local_dir,
+            allow_patterns=allow_patterns,
+            token=token,
+            max_workers=max_workers,
+        )
+    except Exception as e:
+        raise RuntimeError(f"dataset snapshot download failed: {last_err}; fallback error={e}")
+
+
+def cli_download_fallback(dataset_id: str, local_dir: str, token: str | None = None) -> None:
+    """Last-resort CLI fallback. Downloads the dataset repo snapshot.
+
+    This may download more files than the SDK allow_patterns route, but it is robust
+    across SDK versions. Use only after SDK failure.
+    """
+    cmd = ["modelscope", "download", "--dataset", dataset_id, "--local_dir", local_dir]
+    env = os.environ.copy()
+    if token:
+        env["MODELSCOPE_TOKEN"] = token
+    print("[WARN] Falling back to CLI:", " ".join(cmd))
+    subprocess.check_call(cmd, env=env)
 
 
 def find_downloaded_paths(local_dir: str | Path) -> tuple[Path | None, Path | None]:
     """Find subject .mat root and L2 text protocol CSV after ModelScope download.
 
-    This explicitly supports the user's actual layout where 1-20.mat and the
-    protocol CSV are placed directly in the dataset root.
+    Supports the real layout where 1-20.mat and protocol CSV are in dataset root.
     """
     return discover_seedvii_paths(local_dir)
 
 
+def _print_discovery(local_dir: str | Path) -> tuple[Path | None, Path | None]:
+    eeg_root, text_csv = find_downloaded_paths(local_dir)
+    print(f"[DISCOVERY] local_dir={local_dir}")
+    print(f"[DISCOVERY] EEG_ROOT={eeg_root}")
+    print(f"[DISCOVERY] TEXT_CSV={text_csv}")
+    if eeg_root:
+        mats = sorted([p.name for p in Path(eeg_root).glob("*.mat") if p.name in SUBJECT_FILE_NAMES])
+        print(f"[DISCOVERY] subject mat count in EEG_ROOT={len(mats)}; first={mats[:5]}")
+    return eeg_root, text_csv
+
+
 def main():
-    ap = argparse.ArgumentParser(description="Download SEED-VII EEG_preprocessed subject H5 .mat and text_protocol.csv from ModelScope dataset")
+    ap = argparse.ArgumentParser(description="Download/discover SEED-VII root-level 1-20.mat and text_protocol.csv from ModelScope dataset")
     ap.add_argument("--dataset-id", default="DEREKVERSE/SEED-VII")
     ap.add_argument("--local-dir", required=True)
     ap.add_argument("--revision", default="master")
     ap.add_argument("--token", default=None, help="or set MODELSCOPE_TOKEN")
     ap.add_argument("--max-workers", type=int, default=4)
     ap.add_argument("--list-only", action="store_true")
+    ap.add_argument("--force-download", action="store_true", help="download even if local_dir already has mats and text CSV")
+    ap.add_argument("--direct-pattern-download", action="store_true", help="skip API listing; directly download 1-20.mat patterns and all CSVs")
+    ap.add_argument("--cli-fallback", action="store_true", help="if SDK download fails, call modelscope CLI")
     args = ap.parse_args()
     token = args.token or os.environ.get("MODELSCOPE_TOKEN")
+    local_dir = Path(args.local_dir)
+    local_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"[ModelScope] listing dataset files with repo_type='dataset': {args.dataset_id}")
-    files = list_dataset_files(args.dataset_id, args.revision, token)
-    print(f"[ModelScope] total files listed: {len(files)}")
-    selected = select_seedvii_files(files)
-    print("[ModelScope] selected files:")
-    for p in selected:
-        print("  ", p)
-    if args.list_only:
+    # 0) Local discovery first. This fixes the common case where files are already
+    # mounted/downloaded in the dataset root.
+    eeg_root, text_csv = _print_discovery(local_dir)
+    if eeg_root is not None and text_csv is not None and not args.force_download:
+        print("[OK] Required files already present; skip download. Use --force-download to re-download.")
         return
-    if not selected:
-        raise RuntimeError("No 1-20.mat or text_protocol*.csv selected. Please check dataset file layout.")
-    local = dataset_download(args.dataset_id, args.local_dir, selected, args.revision, token, args.max_workers)
-    eeg_root, text_csv = find_downloaded_paths(local)
-    print(f"[OK] downloaded to: {local}")
-    print(f"[OK] EEG_ROOT={eeg_root}")
-    print(f"[OK] TEXT_CSV={text_csv}")
+
+    allow_patterns = default_allow_patterns()
+
+    if args.list_only or not args.direct_pattern_download:
+        try:
+            print(f"[ModelScope] listing dataset files with repo_type='dataset': {args.dataset_id}")
+            files = list_dataset_files(args.dataset_id, args.revision, token)
+            print(f"[ModelScope] total files listed: {len(files)}")
+            selected = select_seedvii_files(files)
+            print("[ModelScope] selected files from listing:")
+            for p in selected:
+                print("  ", p)
+            if args.list_only:
+                return
+            if selected:
+                allow_patterns = selected
+            else:
+                print("[WARN] Listing succeeded but selected no files; using default root/nested patterns.")
+        except Exception as e:
+            if args.list_only:
+                raise
+            print(f"[WARN] Dataset listing failed ({type(e).__name__}: {e}); using direct allow_patterns download.")
+
+    try:
+        dataset_snapshot_download_compat(args.dataset_id, str(local_dir), allow_patterns, args.revision, token, args.max_workers)
+    except Exception as e:
+        if args.cli_fallback:
+            cli_download_fallback(args.dataset_id, str(local_dir), token)
+        else:
+            raise
+
+    eeg_root, text_csv = _print_discovery(local_dir)
+    if eeg_root is None:
+        raise RuntimeError(
+            "Downloaded/discovered files do not include 1-20.mat. "
+            "Check ModelScope dataset layout or run with --direct-pattern-download / --cli-fallback.")
     if text_csv is None:
-        raise RuntimeError("text_protocol*.csv was not found after download. The LLM Tower requires your L2 text protocol.")
+        raise RuntimeError(
+            "Downloaded/discovered files do not include a CSV with trial + l2_text columns. "
+            "Put text_protocol.csv in dataset root or set data.text_csv_path manually.")
+    print("[OK] dataset ready")
 
 
 if __name__ == "__main__":

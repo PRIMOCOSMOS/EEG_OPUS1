@@ -6,6 +6,8 @@ import os
 from pathlib import Path
 from typing import List
 
+from seedvii_contrastive.data.discovery import discover_seedvii_paths
+
 
 def _file_path(entry: dict) -> str:
     return entry.get("Path") or entry.get("path") or entry.get("Name") or entry.get("name") or ""
@@ -59,9 +61,10 @@ def select_seedvii_files(files: List[str]) -> List[str]:
         low = p.lower()
         if base in subject_names:
             selected.append(p)
-        elif fnmatch.fnmatch(low, "*text_protocol*.csv"):
-            selected.append(p)
-        elif fnmatch.fnmatch(low, "*videoid_to_emotion*.csv"):
+        elif low.endswith(".csv"):
+            # Protocol CSVs are small and may live directly in the dataset root
+            # with names such as text_protocol.csv / videoid_to_emotion.csv.
+            # Download all CSVs to avoid missing the user's L2 protocol.
             selected.append(p)
     return sorted(set(selected))
 
@@ -96,17 +99,12 @@ def dataset_download(dataset_id: str, local_dir: str, allow_patterns: List[str],
 
 
 def find_downloaded_paths(local_dir: str | Path) -> tuple[Path | None, Path | None]:
-    root = Path(local_dir)
-    mat_files = [p for p in root.rglob("*.mat") if p.name in {f"{i}.mat" for i in range(1,21)} | {f"{i:02d}.mat" for i in range(1,21)}]
-    text_files = sorted(root.rglob("text_protocol*.csv"))
-    eeg_root = None
-    if mat_files:
-        # Choose the directory containing the most subject mats.
-        counts = {}
-        for p in mat_files:
-            counts[p.parent] = counts.get(p.parent, 0) + 1
-        eeg_root = max(counts, key=counts.get)
-    return eeg_root, (text_files[0] if text_files else None)
+    """Find subject .mat root and L2 text protocol CSV after ModelScope download.
+
+    This explicitly supports the user's actual layout where 1-20.mat and the
+    protocol CSV are placed directly in the dataset root.
+    """
+    return discover_seedvii_paths(local_dir)
 
 
 def main():

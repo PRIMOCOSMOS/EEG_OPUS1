@@ -8,7 +8,8 @@ runtime:
 data:
   modelscope_dataset_id: DEREKVERSE/SEED-VII
   local_dataset_dir: /mnt/workspace/seedvii_ms_dataset
-  eeg_root: /mnt/workspace/seedvii_ms_dataset/EEG_preprocessed
+  # In the current ModelScope dataset, 1-20.mat and text_protocol.csv are in the dataset root.
+  eeg_root: /mnt/workspace/seedvii_ms_dataset
   text_csv_path: /mnt/workspace/seedvii_ms_dataset/text_protocol.csv
   npz_dir: /mnt/workspace/seedvii_npz
   fs: 200
@@ -30,14 +31,14 @@ model:
     D: 2
     F2: 16
     kernel_length: 64
-    dropout: 0.3
+    dropout: 0.25
   llm:
     # Recommended to set this to a local path downloaded by modelscope.snapshot_download in the notebook.
     model_name_or_path: /mnt/workspace/models/Qwen2.5-0.5B-Instruct
     max_length: 64
     lora_r: 8
     lora_alpha: 16
-    lora_dropout: 0.10
+    lora_dropout: 0.05
     target_modules: [q_proj, k_proj, v_proj, o_proj]
     gradient_checkpointing: false
 
@@ -47,11 +48,11 @@ loss:
   beta_llm: 0.35
 
 train:
-  batch_size: 96
+  batch_size: 48
   steps_per_epoch: 300
   epochs: 50
   lr_eeg: 0.001
-  lr_llm: 0.00002
+  lr_llm: 0.00005
   lr_proj: 0.0002
   weight_decay: 0.00001
   num_workers: 2

@@ -20,6 +20,7 @@ from seedvii_contrastive.models.llm_tower import LoRATextTower
 from seedvii_contrastive.losses import TriContrastiveLoss
 from seedvii_contrastive.metrics import accuracy_macro_f1
 from seedvii_contrastive.utils import load_yaml, save_json, set_seed, resolve_device, now
+from seedvii_contrastive.data.discovery import discover_seedvii_paths
 
 
 def collate(batch):
@@ -126,6 +127,30 @@ def main():
         cfg["data"]["npz_dir"] = args.npz_dir
     if args.output_dir:
         cfg["runtime"]["output_dir"] = args.output_dir
+
+    # Robust path discovery: the user's ModelScope dataset stores 1-20.mat and
+    # protocol CSV directly in the dataset root. If configured text/eeg paths are
+    # stale (e.g. expecting EEG_preprocessed/), rediscover from local_dataset_dir.
+    dcfg = cfg.get("data", {})
+    roots_to_try = []
+    for key in ("local_dataset_dir", "eeg_root"):
+        if dcfg.get(key):
+            roots_to_try.append(Path(dcfg[key]))
+    if dcfg.get("npz_dir"):
+        roots_to_try.append(Path(dcfg["npz_dir"]).parent)
+    for r in roots_to_try:
+        if not r.exists():
+            continue
+        eeg_root, text_csv = discover_seedvii_paths(r)
+        if eeg_root is not None and (not dcfg.get("eeg_root") or not Path(dcfg["eeg_root"]).exists()):
+            cfg["data"]["eeg_root"] = str(eeg_root)
+        if text_csv is not None and (not dcfg.get("text_csv_path") or not Path(dcfg["text_csv_path"]).exists()):
+            cfg["data"]["text_csv_path"] = str(text_csv)
+        if cfg["data"].get("text_csv_path") and Path(cfg["data"]["text_csv_path"]).exists():
+            break
+    if not cfg["data"].get("text_csv_path") or not Path(cfg["data"]["text_csv_path"]).exists():
+        raise FileNotFoundError("Cannot find L2 text protocol CSV. Put text_protocol.csv in dataset root or set data.text_csv_path.")
+
     set_seed(cfg.get("seed", 42))
     device = resolve_device(cfg["runtime"].get("device", "auto"))
     out_dir = Path(cfg["runtime"]["output_dir"]); out_dir.mkdir(parents=True, exist_ok=True)

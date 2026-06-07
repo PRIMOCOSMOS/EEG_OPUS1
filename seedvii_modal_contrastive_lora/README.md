@@ -1,11 +1,11 @@
 # SEED-VII EEGNet × LoRA-LLM 三分类对比学习库
 
-本库按新要求重写：借鉴 Brain-CLIPLM 的跨模态对比学习框架，但适配 **ModelScope 数据集 `DEREKVERSE/SEED-VII` 中的 `EEG_preprocessed/1-20.mat` HDF5 文件**，并且 **LLM Tower 只使用你参考库 CSV 协议里的 L2 文本**。
+本库按新要求重写：借鉴 Brain-CLIPLM 的跨模态对比学习框架，但适配 **ModelScope 数据集 `DEREKVERSE/SEED-VII` 根目录中的 `1-20.mat` HDF5 文件**，并且 **LLM Tower 只使用你参考库 CSV 协议里的 L2 文本**。
 
 ## 关键修正
 
 1. **ModelScope 数据拉取**  
-   使用 `dataset_snapshot_download` / `repo_type='dataset'` 的数据集协议，不使用模型协议。脚本会先 listing/search 数据集文件，筛选 `1.mat`...`20.mat` 和 `text_protocol*.csv`。
+   使用 `dataset_snapshot_download` / `repo_type='dataset'` 的数据集协议，不使用模型协议。脚本会先 listing/search 数据集文件，筛选 `1.mat`...`20.mat`，并下载根目录/子目录下所有 CSV，再自动识别含 `trial` + `l2_text` 的协议 CSV。
 
 2. **H5 真实格式**  
    每个 subject 文件内部 key 为 `1`...`80`，每个 key 对应 MATLAB 变量尺寸 `62×N double`。读取器兼容 h5py 暴露为 `(62,N)` 或 `(N,62)`，统一返回 `(62,N)`。
@@ -89,7 +89,7 @@ python -m seedvii_contrastive.scripts.download_modelscope_seedvii \
 
 ```bash
 python -m seedvii_contrastive.scripts.preprocess_npz \
-  --input-root /mnt/workspace/seedvii_ms_dataset/EEG_preprocessed \
+  --input-root /mnt/workspace/seedvii_ms_dataset \
   --output-dir /mnt/workspace/seedvii_npz \
   --subjects 1-20 \
   --window-sec 4 --stride-sec 4 \
@@ -129,7 +129,7 @@ seedvii_contrastive/
     llm_tower.py      # LoRA LLM text tower
   losses.py           # L_inter + beta_eeg L_eeg + beta_llm L_llm
   scripts/
-    download_modelscope_seedvii.py
+    download_modelscope_seedvii.py  # 支持 1-20.mat 和 CSV 均在数据集根目录
     preprocess_npz.py
     train_contrastive.py
     encode_eeg.py

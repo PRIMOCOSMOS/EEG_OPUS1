@@ -12,7 +12,7 @@ import zipfile
 import numpy as np
 from tqdm import tqdm
 
-from .h5io import subject_mat_path, read_trial_array
+from .h5io import subject_mat_path, SubjectMatReader, sniff_mat_file
 from .protocol import trial_to_labels, write_label_protocol_csvs
 from .windowing import center_crop_signal, make_windows, choose_fixed_windows
 
@@ -122,21 +122,28 @@ def preprocess_to_npz(
                 extracted = True
             else:
                 mat_path = subject_mat_path(input_root, sid)
-            for tid in tqdm(range(1, 81), desc=f"S{sid:02d} trials", leave=False):
-                arr = read_trial_array(mat_path, tid)  # (62, N)
-                cropped, crop_start = center_crop_signal(arr, center_ratio=center_ratio)
-                windows, starts = make_windows(cropped, fs=fs, window_sec=window_sec, stride_sec=stride_sec)
-                windows, starts = choose_fixed_windows(windows, starts, max_windows_per_clip, seed=sid * 1000 + tid)
-                fine, val, y3 = trial_to_labels(tid)
-                metas = []
-                for wi, st in enumerate(starts):
-                    metas.append({
-                        "subject": sid, "trial": tid, "fine_emotion": fine, "valence": val,
-                        "label3": y3, "window_id": wi, "start_sample": int(crop_start + st),
-                        "n_samples_clip": int(arr.shape[1]),
-                    })
-                if len(windows):
-                    writer.add_many(windows, metas)
+            sig = sniff_mat_file(mat_path)
+            tqdm.write(f"[preprocess] S{sid:02d} file={mat_path} size={sig['size']} kind={sig['kind']}")
+            with SubjectMatReader(mat_path) as reader:
+                keys = set(reader.trial_keys())
+                missing_keys = [str(i) for i in range(1, 81) if str(i) not in keys]
+                if missing_keys:
+                    raise KeyError(f"{mat_path} is missing trial keys: {missing_keys[:20]}{'...' if len(missing_keys)>20 else ''}")
+                for tid in tqdm(range(1, 81), desc=f"S{sid:02d} trials", leave=False):
+                    arr = reader.read_trial(tid)  # (62, N)
+                    cropped, crop_start = center_crop_signal(arr, center_ratio=center_ratio)
+                    windows, starts = make_windows(cropped, fs=fs, window_sec=window_sec, stride_sec=stride_sec)
+                    windows, starts = choose_fixed_windows(windows, starts, max_windows_per_clip, seed=sid * 1000 + tid)
+                    fine, val, y3 = trial_to_labels(tid)
+                    metas = []
+                    for wi, st in enumerate(starts):
+                        metas.append({
+                            "subject": sid, "trial": tid, "fine_emotion": fine, "valence": val,
+                            "label3": y3, "window_id": wi, "start_sample": int(crop_start + st),
+                            "n_samples_clip": int(arr.shape[1]),
+                        })
+                    if len(windows):
+                        writer.add_many(windows, metas)
             if extracted:
                 try:
                     os.remove(mat_path)

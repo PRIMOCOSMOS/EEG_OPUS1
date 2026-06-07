@@ -191,7 +191,8 @@ class LoRATextTower(nn.Module):
         
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
-            out = self.llm(**tok, use_cache=False)
+            # 必须设置output_hidden_states=True才能获取隐藏状态
+            out = self.llm(**tok, use_cache=False, output_hidden_states=True)
         
         h = self._extract_hidden_states(out)
         
@@ -206,26 +207,48 @@ class LoRATextTower(nn.Module):
         return F.normalize(z, dim=-1)
     
     def _extract_hidden_states(self, output) -> torch.Tensor:
-        """从模型输出提取隐藏状态"""
-        if hasattr(output, 'hidden_states') and output.hidden_states is not None:
-            return output.hidden_states[-1]
-        elif hasattr(output, 'last_hidden_state') and output.last_hidden_state is not None:
-            return output.last_hidden_state
+        """从模型输出提取隐藏状态
         
-        for attr_name in ['hidden_states', 'last_hidden_state', 'hidden']:
-            if hasattr(output, attr_name):
-                val = getattr(output, attr_name)
-                if val is not None:
-                    return val[-1] if isinstance(val, tuple) else val
+        处理Qwen等模型的不同输出格式:
+        - 有些模型使用output.hidden_states元组
+        - 有些模型使用output.last_hidden_state
+        """
+        # 方法1: 检查last_hidden_state (最常用)
+        if hasattr(output, 'last_hidden_state') and output.last_hidden_state is not None:
+            hs = output.last_hidden_state
+            if isinstance(hs, torch.Tensor):
+                return hs
         
-        raise RuntimeError(f"Model output missing hidden states. Attributes: {[a for a in dir(output) if not a.startswith('_')]}")
+        # 方法2: 检查hidden_states元组
+        if hasattr(output, 'hidden_states'):
+            hs = output.hidden_states
+            # 如果是特殊对象，尝试转换为元组
+            if hasattr(hs, 'to_tuple'):
+                hs = hs.to_tuple()
+            if hs is not None and len(hs) > 0:
+                # hidden_states通常是最后一层
+                last_hs = hs[-1]
+                if isinstance(last_hs, torch.Tensor):
+                    return last_hs
+        
+        # 方法3: 尝试从past_key_values重建 (部分模型)
+        if hasattr(output, 'logits') and output.logits is not None:
+            # 如果无法获取hidden_states，至少返回logits前的投影
+            # 这是一个fallback方案
+            pass
+        
+        raise RuntimeError(
+            f"Cannot extract hidden states from model output. "
+            f"Available: {[a for a in dir(output) if not a.startswith('_')]}"
+        )
 
     @torch.no_grad()
     def encode_batch(self, texts: List[str]) -> torch.Tensor:
         """批量编码（用于预计算缓存）"""
         device = self.proj.weight.device
         tok = self._tokenize(texts, device)
-        out = self.llm(**tok, use_cache=False)
+        # 必须设置output_hidden_states=True
+        out = self.llm(**tok, use_cache=False, output_hidden_states=True)
         h = self._extract_hidden_states(out)
         
         mask = tok["attention_mask"].unsqueeze(-1).to(dtype=h.dtype)

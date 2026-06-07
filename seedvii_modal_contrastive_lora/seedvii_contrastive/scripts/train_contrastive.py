@@ -20,7 +20,7 @@ from queue import Queue
 
 import numpy as np
 import torch
-from torch.cuda.amp import autocast, GradScaler
+from torch.amp import autocast
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
@@ -196,7 +196,7 @@ def precompute_text_embeddings(text_tower, texts: list, device, batch_size: int 
     all_embeddings = []
     with torch.no_grad():
         # 使用BF16加速预计算
-        with autocast(dtype=torch.bfloat16):
+        with autocast("cuda", dtype=torch.bfloat16):
             for i in range(0, len(texts), batch_size):
                 batch = texts[i:i+batch_size]
                 emb = text_tower(batch)
@@ -307,7 +307,7 @@ def evaluate(eeg, class_z, loader, device):
         x = batch["eeg"].to(device, non_blocking=True)
         y = batch["label"]
         
-        with autocast(dtype=torch.bfloat16):
+        with autocast("cuda", dtype=torch.bfloat16):
             z = eeg(x).float()
             logits = z @ class_z.float().t()
         
@@ -397,10 +397,10 @@ def main():
     gpu_monitor = GPUMonitor(device)
     gpu_monitor.log_memory("Initial")
     
-    # 混合精度配置
+    # 混合精度配置 (使用新版API)
     use_amp = torch.cuda.is_available()
     print(f"[Train] Mixed Precision (AMP BF16): {'enabled' if use_amp else 'disabled'}")
-    scaler = GradScaler() if use_amp else None
+    scaler = torch.amp.GradScaler('cuda') if use_amp else None
     
     out_dir = Path(cfg["runtime"]["output_dir"])
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -567,7 +567,7 @@ def main():
             t_gpu_start = time.perf_counter()
             
             # 前向传播
-            with autocast(enabled=use_amp, dtype=torch.bfloat16):
+            with autocast("cuda", enabled=use_amp, dtype=torch.bfloat16):
                 eeg_z = eeg(x)
                 
                 if train_llm:

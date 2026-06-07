@@ -26,8 +26,15 @@ def load_index(npz_dir: str | Path) -> pd.DataFrame:
     """加载NPZ目录的窗口索引"""
     npz_dir = Path(npz_dir)
     df = pd.read_csv(npz_dir / "index.csv")
-    # 确保abs_shard是字符串类型
-    df["abs_shard"] = df["shard"].astype(str).apply(lambda s: str(npz_dir / s))
+    
+    # 确保所有列都是标量值（不是Series）
+    for col in ["abs_shard", "shard", "idx", "subject", "trial", "label3"]:
+        if col in df.columns:
+            if col == "abs_shard":
+                df[col] = df["shard"].astype(str).apply(lambda s: str(npz_dir / s))
+            else:
+                df[col] = df[col].astype(str)  # 先转字符串再转数值确保一致性
+    
     return df
 
 
@@ -90,12 +97,8 @@ class WindowNpzDataset(Dataset):
         text_csv_path: str | Path,
         cache_size: int = 8,
     ):
-        # 重新索引并确保所有列都是标量值
+        # 使用.values直接获取numpy数组，避免pandas索引问题
         self.df = df.reset_index(drop=True)
-        
-        # 确保abs_shard列是字符串类型
-        if "abs_shard" in self.df.columns:
-            self.df["abs_shard"] = self.df["abs_shard"].astype(str)
         
         # 预计算归一化参数
         self.mean = channel_mean.astype(np.float32)[:, None]
@@ -104,13 +107,19 @@ class WindowNpzDataset(Dataset):
         self.cache_size = cache_size
         self.cache: OrderedDict[str, dict] = OrderedDict()
         self.text_by_trial = load_l2_text_protocol(text_csv_path)
+        
+        # 预提取所有数据为numpy数组，避免每次访问DataFrame
+        self._abs_shard_arr = self.df["abs_shard"].values
+        self._idx_arr = self.df["idx"].values
+        self._label3_arr = self.df["label3"].values
+        self._trial_arr = self.df["trial"].values
+        self._subject_arr = self.df["subject"].values
 
     def __len__(self) -> int:
         return len(self.df)
 
     def _load_shard(self, path: str) -> dict:
         """LRU缓存加载NPZ分片"""
-        # 确保path是字符串
         path_str = str(path)
         if path_str in self.cache:
             self.cache.move_to_end(path_str)
@@ -125,11 +134,12 @@ class WindowNpzDataset(Dataset):
         return item
 
     def __getitem__(self, i: int) -> dict:
-        row = self.df.iloc[i]
-        
-        # 确保获取标量值（避免Series问题）
-        shard_path = str(row["abs_shard"])
-        shard_idx = int(row["idx"])
+        # 使用预提取的numpy数组直接索引，完全避免pandas索引问题
+        shard_path = str(self._abs_shard_arr[i])
+        shard_idx = int(self._idx_arr[i])
+        y = int(self._label3_arr[i])
+        tid = int(self._trial_arr[i])
+        subject = int(self._subject_arr[i])
         
         shard = self._load_shard(shard_path)
         
@@ -137,15 +147,13 @@ class WindowNpzDataset(Dataset):
         x = shard["x"][shard_idx].astype(np.float32)
         x = (x - self.mean) / (self.std + 1e-6)
         
-        y = int(row["label3"])
-        tid = int(row["trial"])
         text = self.text_by_trial[tid]
         
         return {
             "eeg": torch.from_numpy(x).unsqueeze(0),  # (1, 62, T)
             "label": torch.tensor(y, dtype=torch.long),
             "text": text,
-            "subject": int(row["subject"]),
+            "subject": subject,
             "trial": tid,
         }
 

@@ -1,4 +1,8 @@
+# SEED-VII EEG-LLM Contrastive Learning Configuration
+# Optimized for GPU utilization and training speed
+
 seed: 42
+
 runtime:
   device: auto
   output_dir: /mnt/workspace/seedvii_contrastive_runs/run_valence3
@@ -19,7 +23,7 @@ data:
   shard_size: 512
   train_subjects: [1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16]
   val_subjects: [17,18,19,20]
-  cache_size: 8
+  cache_size: 16  # LRU cache for NPZ shards
 
 model:
   embed_dim: 128
@@ -35,11 +39,13 @@ model:
     model_name_or_path: /mnt/workspace/models/Qwen2.5-0.5B-Instruct
     modelscope_model_id: Qwen/Qwen2.5-0.5B-Instruct
     max_length: 64
+    # LoRA配置
     lora_r: 8
     lora_alpha: 16
     lora_dropout: 0.05
     target_modules: [q_proj, k_proj, v_proj, o_proj]
-    gradient_checkpointing: false
+    # 启用梯度检查点节省显存
+    gradient_checkpointing: true
 
 loss:
   temperature: 0.07
@@ -50,9 +56,12 @@ train:
   batch_size: 96
   steps_per_epoch: 300
   epochs: 50
+  # 学习率配置
   lr_eeg: 0.001
   lr_llm: 0.00005
   lr_proj: 0.0002
   weight_decay: 0.00001
-  num_workers: 2
+  # GPU数据加载优化
+  num_workers: 4           # DataLoader worker进程数
+  prefetch_factor: 2       # 每个worker预加载batch数
   resume: true

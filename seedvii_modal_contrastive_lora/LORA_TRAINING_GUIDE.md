@@ -44,29 +44,29 @@
 
 ## 🚀 使用方法
 
-### 模式一：快速推理模式（不训练LLM）
+### 模式一：完整训练模式（默认：训练LoRA + EEG）
 
 ```bash
 python -m seedvii_contrastive.scripts.train_contrastive \
   --config configs/modelscope_default.yaml
 ```
 
-- LLM塔完全冻结，使用预计算文本嵌入
-- 仅训练EEG编码器
-- 训练速度：~1-2秒/batch
-
-### 模式二：完整训练模式（训练LoRA + EEG）
-
-```bash
-python -m seedvii_contrastive.scripts.train_contrastive \
-  --config configs/modelscope_default.yaml \
-  --train-llm
-```
-
 - **LoRA参数解冻**，通过反向传播更新
 - **EEG编码器** 正常训练
 - **投影层** 参与训练
 - 训练速度：~30秒/batch（取决于GPU）
+
+### 模式二：快速冻结文本塔（不训练LLM，仅训练EEG）
+
+```bash
+python -m seedvii_contrastive.scripts.train_contrastive \
+  --config configs/modelscope_default.yaml \
+  --no-train-llm
+```
+
+- LLM塔完全冻结，使用预计算文本嵌入
+- 仅训练EEG编码器
+- 训练速度：~1-2秒/batch
 
 ---
 
@@ -214,7 +214,7 @@ Training: epochs=50, steps_per_epoch=300
 解决方案：
 - 启用 `gradient_checkpointing: true`
 - 减小 `batch_size`
-- 使用 `--train-llm` 时减少 `num_workers`
+- 默认 LoRA 训练时可减少 `num_workers`，或临时使用 `--no-train-llm` 先跑通数据链路
 
 ---
 

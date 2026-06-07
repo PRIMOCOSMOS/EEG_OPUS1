@@ -3,7 +3,7 @@ name = "seedvii-contrastive"
 version = "0.1.0"
 description = "SEED-VII EEGNet + LoRA-LLM tri-class contrastive learning"
 readme = "README.md"
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 dependencies = [
     "torch>=2.0.0",
     "transformers>=4.36.0",

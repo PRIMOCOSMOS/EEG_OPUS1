@@ -133,12 +133,16 @@ class LoRATextTower(nn.Module):
         self._print_trainable_params()
 
     def freeze_all_except_lora(self) -> None:
-        """冻结除LoRA外的所有参数"""
-        print("[LLM Tower] Freezing all except LoRA...")
+        """Freeze the whole text tower for cached-embedding/inference mode.
+
+        The historical method name is kept for compatibility, but inference mode
+        must not leave LoRA tensors trainable; otherwise users see misleading
+        trainable-parameter reports and may accidentally allocate gradients.
+        """
+        print("[LLM Tower] Freezing all text-tower parameters...")
         
-        for name, param in self.llm.named_parameters():
-            if 'lora_' not in name.lower():
-                param.requires_grad = False
+        for _, param in self.llm.named_parameters():
+            param.requires_grad = False
         
         for param in self.proj.parameters():
             param.requires_grad = False

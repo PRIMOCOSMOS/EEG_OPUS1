@@ -100,3 +100,15 @@ else:
 # 将 proj 层转换为与 LLM 模型相同的 dtype
 self.proj = self.proj.to(dtype=llm_dtype, device=llm_device)
 ```
+
+### 本次数据管线稳定性修复
+
+训练前的数据索引现在会进行强校验：
+
+- `load_index(npz_dir)` 会自动从 `shard` 生成/刷新 `abs_shard`，旧版 `index.csv` 不再因为缺少 `abs_shard` 报 `KeyError`。
+- `subject / trial / label3 / idx` 保持整数类型，避免 YAML 里的 `[1,2,...]` 与字符串 subject 不匹配导致 `train=0, val=0`。
+- 训练脚本会在模型加载前检查 train/val 是否为空，并打印可用 subject 与配置 subject，方便定位配置或预处理问题。
+- 类均衡采样器现在按 `batch_sampler=` 接入 DataLoader，避免把“一个 batch 的索引列表”误当成单个样本索引。
+- `num_workers=0`、CPU 设备、`--no-train-llm` 缓存文本嵌入等模式均做了兼容处理。
+
+如果你已经生成过旧的 `/mnt/workspace/seedvii_npz/index.csv`，无需仅因缺少 `abs_shard` 重新预处理；更新代码后重新运行训练即可。但如果日志仍显示可用 subject 为空或 shard 文件缺失，请删除旧的 `seedvii_npz` 后重新执行预处理。

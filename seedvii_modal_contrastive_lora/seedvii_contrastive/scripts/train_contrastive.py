@@ -19,6 +19,7 @@ if str(_PROJECT_ROOT) not in sys.path:
 import argparse
 from pathlib import Path
 from collections import Counter
+from contextlib import nullcontext
 import time
 
 import numpy as np
@@ -43,8 +44,8 @@ from seedvii_contrastive.utils import load_yaml, set_seed, resolve_device
 class GPUMonitor:
     """GPU利用率监控器"""
     def __init__(self, device):
-        self.device = device
-        self.enabled = torch.cuda.is_available()
+        self.device = torch.device(device)
+        self.enabled = self.device.type == "cuda" and torch.cuda.is_available()
         
     def get_utilization(self) -> float:
         if not self.enabled:
@@ -52,11 +53,12 @@ class GPUMonitor:
         try:
             import pynvml
             pynvml.nvmlInit()
-            handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+            index = self.device.index if self.device.index is not None else torch.cuda.current_device()
+            handle = pynvml.nvmlDeviceGetHandleByIndex(index)
             util = pynvml.nvmlDeviceGetUtilizationRates(handle)
             pynvml.nvmlShutdown()
             return util.gpu
-        except:
+        except Exception:
             return -1.0
     
     def log_memory(self, tag: str = ""):
@@ -75,6 +77,53 @@ def collate_fn(batch):
         "texts": [b["text"] for b in batch],
         "trials": torch.as_tensor([b["trial"] for b in batch], dtype=torch.int64),
     }
+
+
+def _torch_device(device) -> torch.device:
+    return torch.device(device)
+
+
+def _is_cuda_device(device) -> bool:
+    d = _torch_device(device)
+    return d.type == "cuda" and torch.cuda.is_available()
+
+
+def _amp_context(device, enabled: bool = True):
+    """Return a CUDA autocast context only when the selected device is CUDA."""
+    if enabled and _is_cuda_device(device):
+        return autocast("cuda", dtype=torch.bfloat16)
+    return nullcontext()
+
+
+def _dataloader_worker_kwargs(num_workers: int, prefetch_factor: int | None = None) -> dict:
+    """Build DataLoader kwargs that are valid for both num_workers=0 and >0."""
+    num_workers = int(num_workers)
+    kwargs = {"num_workers": num_workers}
+    if num_workers > 0:
+        kwargs["prefetch_factor"] = prefetch_factor if prefetch_factor is not None else 2
+        kwargs["persistent_workers"] = True
+    return kwargs
+
+
+def validate_training_split(df, tr_df, va_df, train_subjects, val_subjects) -> None:
+    """Fail early with useful diagnostics when the split/config is wrong."""
+    available = sorted(int(x) for x in df["subject"].unique().tolist()) if "subject" in df else []
+    train_subjects = [int(s) for s in train_subjects]
+    val_subjects = [int(s) for s in val_subjects]
+    problems = []
+    if len(tr_df) == 0:
+        problems.append("training split has 0 windows")
+    if len(va_df) == 0:
+        problems.append("validation split has 0 windows")
+    if problems:
+        raise ValueError(
+            "Invalid subject split: " + "; ".join(problems) + "\n"
+            f"Available subjects in index.csv: {available}\n"
+            f"Configured train_subjects: {train_subjects}\n"
+            f"Configured val_subjects: {val_subjects}\n"
+            "Fix configs/modelscope_default.yaml (or your run config) so the subject IDs match index.csv, "
+            "or rerun preprocessing if the index is stale/empty."
+        )
 
 
 # =============== 路径解析函数 ===============
@@ -114,8 +163,10 @@ def resolve_llm_model_path(llm_cfg: dict) -> str:
                 print(f"[LLM Tower] resolved: {raw} -> {found}")
                 return str(found)
 
-    model_id = llm_cfg.get("modelscope_model_id") or "Qwen/Qwen2.5-0.5B-Instruct"
-    cache_dir = str(p.parent if p.parent != Path("") else Path("/mnt/workspace/models"))
+    model_id = llm_cfg.get("modelscope_model_id") or raw or "Qwen/Qwen2.5-0.5B-Instruct"
+    # For model-id strings like "Qwen/Qwen2.5-0.5B-Instruct", Path(raw).parent
+    # would be "Qwen".  Use a stable workspace cache instead.
+    cache_dir = str(p.parent if (p.is_absolute() or raw.startswith((".", "~"))) else Path("/mnt/workspace/models"))
     print(f"[LLM Tower][WARN] path not found: {raw}")
     
     try:
@@ -135,12 +186,14 @@ def precompute_text_embeddings(text_tower, texts: list, device, batch_size: int 
     
     all_embeddings = []
     with torch.no_grad():
-        with autocast("cuda", dtype=torch.bfloat16):
+        with _amp_context(device):
             for i in range(0, len(texts), batch_size):
                 batch = texts[i:i+batch_size]
                 emb = text_tower(batch)
                 all_embeddings.append(emb.float().cpu())
                 
+    if not all_embeddings:
+        raise ValueError("no texts were provided for text embedding precomputation")
     text_embeddings = torch.cat(all_embeddings, dim=0)
     print(f"[Precompute] Done. shape={text_embeddings.shape}")
     return text_embeddings
@@ -207,13 +260,13 @@ def build_models(cfg, device, train_llm: bool = True):
     print(f"[LLM Tower] {text.trainable_parameters_report()}")
     
     # GPU预热
-    if torch.cuda.is_available():
+    if _is_cuda_device(device):
         with torch.no_grad():
             dummy = torch.zeros(1, 1, 62, 800, device=device)
             _ = eeg(dummy)
             if train_llm:
                 _ = text(["warmup"])
-        torch.cuda.synchronize()
+        torch.cuda.synchronize(_torch_device(device))
         print("[GPU] Warmup completed")
     
     return eeg, text
@@ -261,7 +314,7 @@ def evaluate(eeg, class_z, loader, device):
         x = batch["eeg"].to(device, non_blocking=True)
         y = batch["label"]
         
-        with autocast("cuda", dtype=torch.bfloat16):
+        with _amp_context(device):
             z = eeg(x).float()
             logits = z @ class_z.float().t()
         
@@ -355,7 +408,7 @@ def main():
     gpu_monitor.log_memory("Initial")
     
     # 混合精度配置
-    use_amp = torch.cuda.is_available()
+    use_amp = _is_cuda_device(device)
     print(f"[Train] AMP BF16: {'enabled' if use_amp else 'disabled'}")
     scaler = torch.amp.GradScaler('cuda') if use_amp else None
     
@@ -366,9 +419,10 @@ def main():
     print("\n[Step 1/6] Loading dataset...")
     df = load_index(dcfg["npz_dir"])
     tr_df, va_df = split_index_by_subjects(df, dcfg["train_subjects"], dcfg["val_subjects"])
+    validate_training_split(df, tr_df, va_df, dcfg["train_subjects"], dcfg["val_subjects"])
     print(f"[Data] train={len(tr_df)}, val={len(va_df)}")
 
-    tr_labels = tr_df["label3"].tolist()
+    tr_labels = [int(x) for x in tr_df["label3"].tolist()]
     print(f"[Data] class counts: {dict(sorted(Counter(tr_labels).items()))}")
 
     norm_stats_path = out_dir / "norm_stats.npz"
@@ -401,7 +455,7 @@ def main():
     text_embeddings = precompute_text_embeddings(text, bank_texts, device, batch_size=32)
     class_z = build_class_prototypes(text_embeddings, bank_labels, device)
     text_embeddings_gpu = text_embeddings.to(device, non_blocking=True)
-    trial_to_emb_idx = [trial - 1 for trial in range(1, 81)]
+    trial_to_emb_idx = {trial: trial - 1 for trial in range(1, 81)}
     
     # ==================== 数据加载器 ====================
     print("\n[Step 4/6] Setting up data loaders...")
@@ -411,32 +465,29 @@ def main():
     prefetch_factor = tcfg.get("prefetch_factor", 2)
     
     train_sampler = ClassBalancedBatchSampler(
-        train_ds.df["label3"].tolist(),
+        [int(x) for x in train_ds.df["label3"].tolist()],
         batch_size=batch_size,
         steps_per_epoch=tcfg.get("steps_per_epoch", None),
         seed=cfg.get("seed", 42),
     )
     
+    loader_worker_kwargs = _dataloader_worker_kwargs(num_workers, prefetch_factor)
+    pin_memory = _is_cuda_device(device)
     train_loader = DataLoader(
         train_ds,
-        batch_size=batch_size,
-        sampler=train_sampler,
-        num_workers=num_workers,
+        batch_sampler=train_sampler,
         collate_fn=collate_fn,
-        pin_memory=True,
-        prefetch_factor=prefetch_factor,
-        persistent_workers=True,
+        pin_memory=pin_memory,
+        **loader_worker_kwargs,
     )
     
     val_loader = DataLoader(
         val_ds,
         batch_size=batch_size,
         shuffle=False,
-        num_workers=num_workers,
         collate_fn=collate_fn,
-        pin_memory=True,
-        prefetch_factor=prefetch_factor,
-        persistent_workers=True,
+        pin_memory=pin_memory,
+        **loader_worker_kwargs,
     )
     
     print(f"[DataLoader] batch={batch_size}, workers={num_workers}, prefetch={prefetch_factor}")
@@ -477,15 +528,13 @@ def main():
     total_train_time = 0.0
     
     for epoch in range(start_epoch, tcfg["epochs"]):
-        # 重置数据迭代器，确保每个epoch从头开始
-        data_iter = iter(train_loader)
-        
+        # 必须在创建 DataLoader iterator 之前设置 epoch，保证采样可复现且每轮不同。
         train_sampler.set_epoch(epoch)
         eeg.train()
         if train_llm:
             text.train()
         
-        pbar = tqdm(train_sampler, desc=f"epoch {epoch}", leave=False)
+        pbar = tqdm(train_loader, total=len(train_sampler), desc=f"epoch {epoch}", leave=False)
         epoch_losses = []
         epoch_inter = []
         
@@ -494,16 +543,10 @@ def main():
         batch_times = []
         gpu_times = []
         
-        for batch_idx, _ in enumerate(pbar):
+        for batch_idx, batch in enumerate(pbar):
             t_data_start = time.perf_counter()
             
             # ========== 获取数据 ==========
-            try:
-                batch = next(data_iter)
-            except StopIteration:
-                data_iter = iter(train_loader)
-                batch = next(data_iter)
-            
             x = batch["eeg"].to(device, non_blocking=True)
             y = batch["label"].to(device, non_blocking=True)
             trials = batch["trials"]
@@ -512,7 +555,7 @@ def main():
             t_gpu_start = time.perf_counter()
             
             # ========== 前向传播 ==========
-            with autocast("cuda", enabled=use_amp, dtype=torch.bfloat16):
+            with _amp_context(device, enabled=use_amp):
                 eeg_z = eeg(x)
                 
                 if train_llm:
@@ -520,7 +563,7 @@ def main():
                     text_z = text(batch["texts"])
                 else:
                     # 推理模式：使用缓存的文本嵌入
-                    emb_indices = [trial_to_emb_idx[t.item()] for t in trials]
+                    emb_indices = [trial_to_emb_idx[int(t.item())] for t in trials]
                     text_z = text_embeddings_gpu[emb_indices]
                 
                 loss_dict = criterion(eeg_z, text_z, y)

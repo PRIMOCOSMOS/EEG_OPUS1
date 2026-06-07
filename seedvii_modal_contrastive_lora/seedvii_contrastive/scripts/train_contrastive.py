@@ -42,12 +42,84 @@ def collate(batch):
     }
 
 
+def _looks_like_transformers_model_dir(path: Path) -> bool:
+    return path.exists() and (path / "config.json").exists()
+
+
+def _find_local_llm_dir(base: Path, preferred_name: str = "") -> Path | None:
+    """Find an actual Transformers model directory under a ModelScope cache/local dir.
+
+    ModelScope snapshot_download may return a nested snapshot path, while notebooks
+    often store a guessed path such as /mnt/workspace/models/Qwen2.5-0.5B-Instruct.
+    If that guessed path does not exist, Transformers treats it as a Hub repo id
+    and raises HFValidationError. This helper searches for a real directory that
+    contains config.json.
+    """
+    if not base.exists():
+        return None
+    candidates = [p.parent for p in base.rglob("config.json") if p.is_file()]
+    if not candidates:
+        return None
+    # Prefer dirs containing the requested model basename, otherwise choose the
+    # shortest path (usually the snapshot root rather than a nested subdir).
+    preferred_name = preferred_name.lower()
+    if preferred_name:
+        hits = [c for c in candidates if preferred_name in str(c).lower()]
+        if hits:
+            return sorted(hits, key=lambda x: len(str(x)))[0]
+    return sorted(candidates, key=lambda x: len(str(x)))[0]
+
+
+def resolve_llm_model_path(llm_cfg: dict) -> str:
+    """Resolve local/ModelScope LLM path robustly.
+
+    If model_name_or_path is an existing local directory, use it. If it is a
+    non-existing absolute path, search its parent; if still missing, download the
+    ModelScope model id specified by `modelscope_model_id`.
+    """
+    raw = str(llm_cfg["model_name_or_path"])
+    p = Path(raw).expanduser()
+    if _looks_like_transformers_model_dir(p):
+        return str(p)
+
+    if p.is_absolute() or raw.startswith(".") or raw.startswith("~"):
+        search_roots = []
+        if p.exists():
+            search_roots.append(p)
+        search_roots.append(p.parent)
+        for root in search_roots:
+            found = _find_local_llm_dir(root, preferred_name=p.name)
+            if found is not None:
+                print(f"[LLM Tower] resolved local model path: {raw} -> {found}")
+                return str(found)
+
+        model_id = llm_cfg.get("modelscope_model_id") or llm_cfg.get("hf_model_id") or "Qwen/Qwen2.5-0.5B-Instruct"
+        cache_dir = str(p.parent if p.parent != Path("") else Path("/mnt/workspace/models"))
+        print(f"[LLM Tower][WARN] local model path does not exist or lacks config.json: {raw}")
+        print(f"[LLM Tower] downloading ModelScope model {model_id} to cache_dir={cache_dir}")
+        try:
+            from modelscope import snapshot_download
+            model_dir = snapshot_download(model_id, cache_dir=cache_dir)
+            print(f"[LLM Tower] downloaded/resolved model_dir={model_dir}")
+            return str(model_dir)
+        except Exception as e:
+            raise FileNotFoundError(
+                f"Cannot resolve local LLM path {raw!r}, and ModelScope download of {model_id!r} failed: {e}. "
+                f"Fix config model.llm.model_name_or_path to the actual snapshot_download return path, "
+                f"or set model.llm.modelscope_model_id."
+            ) from e
+
+    # Non-local string such as 'Qwen/Qwen2.5-0.5B-Instruct'. Let transformers handle it.
+    return raw
+
+
 def build_models(cfg, device):
     mcfg = cfg["model"]
     eeg = EEGNetEncoder(embed_dim=mcfg["embed_dim"], **mcfg["eegnet"]).to(device)
     llm_cfg = mcfg["llm"]
+    llm_path = resolve_llm_model_path(llm_cfg)
     text = LoRATextTower(
-        model_name_or_path=llm_cfg["model_name_or_path"],
+        model_name_or_path=llm_path,
         embed_dim=mcfg["embed_dim"],
         lora_r=llm_cfg.get("lora_r", 8),
         lora_alpha=llm_cfg.get("lora_alpha", 16),

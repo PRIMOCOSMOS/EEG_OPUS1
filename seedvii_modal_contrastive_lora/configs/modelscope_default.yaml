@@ -34,7 +34,11 @@ model:
     dropout: 0.25
   llm:
     # Recommended to set this to a local path downloaded by modelscope.snapshot_download in the notebook.
+    # model_name_or_path may be an actual local snapshot dir. If this guessed path
+    # does not exist, train_contrastive.py will search under its parent or download
+    # modelscope_model_id automatically.
     model_name_or_path: /mnt/workspace/models/Qwen2.5-0.5B-Instruct
+    modelscope_model_id: Qwen/Qwen2.5-0.5B-Instruct
     max_length: 64
     lora_r: 8
     lora_alpha: 16

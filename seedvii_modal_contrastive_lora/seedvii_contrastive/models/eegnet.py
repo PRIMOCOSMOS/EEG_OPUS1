@@ -10,6 +10,8 @@ class EEGNetEncoder(nn.Module):
 
     Input shape: (B, 1, 62, T), T=800 for 4s@200Hz.
     Output: L2-normalized embedding of shape (B, embed_dim).
+    
+    FIX: Ensures consistent float32 output regardless of input dtype.
     """
 
     def __init__(
@@ -50,16 +52,26 @@ class EEGNetEncoder(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward pass returning L2-normalized float32 embedding."""
+        # FIX: Ensure input is float32 for numerical stability
+        if x.dtype != torch.float32:
+            x = x.to(dtype=torch.float32)
+            
         z = self.temporal(x)
         z = self.spatial(z)
         z = self.separable(z)
         z = self.pool(z)
         z = self.proj(z)
+        
+        # Ensure output is float32
+        if z.dtype != torch.float32:
+            z = z.to(dtype=torch.float32)
+            
         return F.normalize(z, dim=-1)
 
 
 class EEGNetClassifier(nn.Module):
-    """Optional classifier wrapper for probing. The contrastive trainer uses EEGNetEncoder."""
+    """Optional classifier wrapper for probing."""
 
     def __init__(self, encoder: EEGNetEncoder, embed_dim: int = 128, num_classes: int = 3):
         super().__init__()

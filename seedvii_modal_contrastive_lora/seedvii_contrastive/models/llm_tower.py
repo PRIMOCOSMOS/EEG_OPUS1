@@ -4,8 +4,7 @@ LoRA-enabled LLM Text Tower for EEG-LLM Contrastive Learning
 关键特性：
 - LoRA适配器高效微调Qwen模型
 - 支持BF16/FP32混合精度
-- 优化tokenization和前向传播
-- torch.compile 延迟加载（避免 import-time hang）
+- 直接 tokenize（不 compile — 字符串输入是 compile 反模式）
 """
 from __future__ import annotations
 
@@ -48,19 +47,16 @@ class LoRATextTower(nn.Module):
         self.max_length = max_length
         self.embed_dim = embed_dim
         
-        # Tokenizer初始化
         self.tokenizer = AutoTokenizer.from_pretrained(
             model_name_or_path, trust_remote_code=trust_remote_code
         )
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
         
-        # 默认使用BF16以加速训练
         if dtype is None:
             dtype = torch.bfloat16
         self._dtype = dtype
         
-        # 加载基础模型
         try:
             base = AutoModelForCausalLM.from_pretrained(
                 model_name_or_path,
@@ -101,13 +97,8 @@ class LoRATextTower(nn.Module):
         self.proj = nn.Linear(self.hidden_size, embed_dim)
         self._sync_proj_with_llm()
 
-        # ── torch.compile 延迟加载：不在 import 时触发，运行时按需 ──
-        self._tokenize_fn = self._tokenize_raw   # fallback
-        self._compile_attempted = False
-
-    # ── tokenizer methods ──────────────────────────────────────────
-    def _tokenize_raw(self, texts: List[str], device: torch.device) -> Dict[str, torch.Tensor]:
-        """标准 tokenization（无编译，永不卡顿）"""
+    # ── tokenizer (无 compile — 字符串输入是 torch.compile 反模式) ──
+    def _tokenize(self, texts: List[str], device: torch.device) -> Dict[str, torch.Tensor]:
         tok = self.tokenizer(
             texts,
             padding=True,
@@ -116,22 +107,6 @@ class LoRATextTower(nn.Module):
             return_tensors="pt",
         )
         return {k: v.to(device, non_blocking=True) for k, v in tok.items()}
-
-    def _maybe_compile_tokenizer(self) -> None:
-        """首次调用时尝试 torch.compile tokenizer（安全回退）"""
-        if self._compile_attempted:
-            return
-        self._compile_attempted = True
-        try:
-            # 仅在 forward 被首次调用时尝试 compile；不在 __init__/import 时触发
-            self._tokenize_fn = torch.compile(
-                self._tokenize_raw, mode="reduce-overhead"
-            )
-            print("[LLM Tower] tokenizer compiled (reduce-overhead)")
-        except Exception as e:
-            # 安全回退：保持 _tokenize_raw
-            self._tokenize_fn = self._tokenize_raw
-            print(f"[LLM Tower] tokenizer compile skipped ({e})")
 
     # ── public API ─────────────────────────────────────────────────
     def _print_trainable_params(self) -> None:
@@ -180,10 +155,7 @@ class LoRATextTower(nn.Module):
     # ── forward ────────────────────────────────────────────────────
     def forward(self, texts: List[str]) -> torch.Tensor:
         device = self.proj.weight.device
-
-        # 首次调用时尝试 compile tokenizer（import 时完全跳过）
-        self._maybe_compile_tokenizer()
-        tok = self._tokenize_fn(texts, device)
+        tok = self._tokenize(texts, device)
 
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
@@ -217,8 +189,7 @@ class LoRATextTower(nn.Module):
     @torch.no_grad()
     def encode_batch(self, texts: List[str]) -> torch.Tensor:
         device = self.proj.weight.device
-        self._maybe_compile_tokenizer()
-        tok = self._tokenize_fn(texts, device)
+        tok = self._tokenize(texts, device)
         out = self.llm(**tok, use_cache=False, output_hidden_states=True)
         h = self._extract_hidden_states(out)
         mask = tok["attention_mask"].unsqueeze(-1).to(dtype=h.dtype)

@@ -108,6 +108,7 @@ def preprocess_to_npz(
 
     summary = {"subjects": subjects, "fs": fs, "window_sec": window_sec, "stride_sec": stride_sec,
                "center_ratio": center_ratio, "max_windows_per_clip": max_windows_per_clip}
+    print(f"[Preprocess] {len(subjects)} subjects, reading first file to detect format...", flush=True)
     try:
         for sid in tqdm(subjects, desc="subjects"):
             extracted = False
@@ -117,9 +118,14 @@ def preprocess_to_npz(
             else:
                 mat_path = subject_mat_path(input_root, sid)
             sig = sniff_mat_file(mat_path)
-            tqdm.write(f"[preprocess] S{sid:02d} file={mat_path} size={sig['size']} kind={sig['kind']}")
+            size_mb = (sig['size'] or 0) / (1024 * 1024)
+            kind = sig['kind']
+            if sig.get('_tiny'):
+                tqdm.write(f"  [WARN] S{sid:02d} {mat_path.name}: {size_mb:.1f} MB — SUSPICIOUSLY SMALL (Git LFS pointer?)")
+            tqdm.write(f"[preprocess] S{sid:02d} {mat_path.name}  {size_mb:.0f} MB  kind={kind}")
             with SubjectMatReader(mat_path) as reader:
                 keys = set(reader.trial_keys())
+                tqdm.write(f"[Preprocess] S{sid:02d} {len(keys)} trials, reading...")
                 missing_keys = [str(i) for i in range(1, 81) if str(i) not in keys]
                 if missing_keys:
                     raise KeyError(f"{mat_path} is missing trial keys: {missing_keys[:20]}{'...' if len(missing_keys)>20 else ''}")

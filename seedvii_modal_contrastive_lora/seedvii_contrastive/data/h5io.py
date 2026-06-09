@@ -45,6 +45,13 @@ def sniff_mat_file(path: str | Path, n: int = 512) -> dict:
         info["kind"] = "html_or_error_page"
     else:
         info["kind"] = "unknown"
+
+    # size sanity check for classic .mat files
+    if info["size"] is not None and info["size"] < 1024 * 10:
+        # Under 10KB — likely Git LFS pointer or truncated download
+        info["_tiny"] = True
+    else:
+        info["_tiny"] = False
     return info
 
 
@@ -105,20 +112,37 @@ class SubjectMatReader:
     def __enter__(self) -> "SubjectMatReader":
         if self.kind == "matlab_v7.3_hdf5":
             try:
+                print(f"  [h5py] {self.mat_path.name} opening (HDF5 format, lazy read)...", flush=True)
                 import h5py
                 self._h5 = h5py.File(self.mat_path, "r")
             except Exception as e:
                 raise OSError(f"Failed to open HDF5 MAT file {self.mat_path}: {e}\n{explain_bad_mat_file(self.mat_path)}") from e
         elif self.kind == "matlab_v5_v7_classic":
+            size_bytes = self.mat_path.stat().st_size
+            size_mb = size_bytes / (1024 * 1024)
+            if size_bytes < 1024 * 20:
+                info = sniff_mat_file(self.mat_path)
+                msg = (
+                    f"\n{'='*60}\n"
+                    f"  FATAL: {self.mat_path.name} is only {size_mb:.1f} MB\n"
+                    f"  This .mat file is too small to contain real EEG data.\n"
+                    f"  Likely cause: Git LFS pointer or truncated download.\n"
+                    f"  Fix: re-run ModelScope download with LFS support.\n"
+                    f"  First bytes: {_format_head(info.get('head', b''), 200)}\n"
+                    f"{'='*60}"
+                )
+                raise OSError(msg)
             try:
                 from scipy.io import loadmat
+                print(f"  [loadmat] {self.mat_path.name} ({size_mb:.0f} MB classic format)"
+                      f" — loading entire file into RAM, please wait...", flush=True)
                 self._mat = loadmat(self.mat_path)
+                print(f"  [loadmat] {self.mat_path.name} loaded.", flush=True)
             except Exception as e:
                 raise OSError(f"Failed to open classic MATLAB MAT file {self.mat_path}: {e}\n{explain_bad_mat_file(self.mat_path)}") from e
         else:
             raise OSError(explain_bad_mat_file(self.mat_path))
         return self
-
     def __exit__(self, exc_type, exc, tb):
         if self._h5 is not None:
             self._h5.close()

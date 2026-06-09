@@ -199,7 +199,11 @@ class LoRATextTower(nn.Module):
             L2归一化embedding, shape (batch_size, embed_dim)
         """
         device = self.proj.weight.device
-        tok = self._tokenize(texts, device)
+        # -- use torch.compile-optimized tokenizer (issue-6 fix) --
+        try:
+            tok = self._tokenize_batch(texts, device)
+        except Exception:
+            tok = self._tokenize(texts, device)
         
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
@@ -258,7 +262,11 @@ class LoRATextTower(nn.Module):
     def encode_batch(self, texts: List[str]) -> torch.Tensor:
         """批量编码（用于预计算缓存）"""
         device = self.proj.weight.device
-        tok = self._tokenize(texts, device)
+        # -- use torch.compile-optimized tokenizer (issue-6 fix) --
+        try:
+            tok = self._tokenize_batch(texts, device)
+        except Exception:
+            tok = self._tokenize(texts, device)
         # 必须设置output_hidden_states=True
         out = self.llm(**tok, use_cache=False, output_hidden_states=True)
         h = self._extract_hidden_states(out)

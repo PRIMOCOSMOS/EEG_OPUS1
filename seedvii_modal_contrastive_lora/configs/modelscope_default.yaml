@@ -1,5 +1,5 @@
 # SEED-VII EEG-LLM Contrastive Learning Configuration
-# Optimized for GPU utilization and training speed
+# -- v4-final: RTX 4090 优化 (TF32 + torch.compile + AdamW fused + MoCo) --
 
 seed: 42
 
@@ -23,45 +23,55 @@ data:
   shard_size: 512
   train_subjects: [1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16]
   val_subjects: [17,18,19,20]
-  cache_size: 16  # LRU cache for NPZ shards
+  cache_size: 16
 
 model:
-  embed_dim: 128
+  embed_dim: 256
   eegnet:
     chans: 62
     samples: 800
-    F1: 8
+    F1: 16
     D: 2
-    F2: 16
+    F2: 32
     kernel_length: 64
     dropout: 0.25
   llm:
     model_name_or_path: /mnt/workspace/models/Qwen2.5-0.5B-Instruct
     modelscope_model_id: Qwen/Qwen2.5-0.5B-Instruct
     max_length: 64
-    # LoRA配置
     lora_r: 8
     lora_alpha: 16
     lora_dropout: 0.05
     target_modules: [q_proj, k_proj, v_proj, o_proj]
-    # 启用梯度检查点节省显存
-    gradient_checkpointing: true
+    gradient_checkpointing: false
+
+# ── MoCo ──
+moco:
+  queue_size: 4096
+  momentum: 0.999
+  warmup_queue_steps: 96
+  tau_queue_adaptive: true
+  tau_queue_target: 0.10
 
 loss:
-  temperature: 0.07
+  temperature: 0.25
+  temperature_warmup_start: 0.50
+  temperature_warmup_epochs: 5
   beta_eeg: 0.65
   beta_llm: 0.35
 
 train:
-  batch_size: 96
+  # RTX 4090 (24 GB): Qwen 0.5B BF16 ≈ 1 GB → 可以开到 192-256
+  batch_size: 192                # 96 → 192 (VRAM 充裕)
   steps_per_epoch: 300
   epochs: 50
-  # 学习率配置
   lr_eeg: 0.001
   lr_llm: 0.00005
   lr_proj: 0.0002
   weight_decay: 0.00001
-  # GPU数据加载优化
-  num_workers: 4           # DataLoader worker进程数
-  prefetch_factor: 2       # 每个worker预加载batch数
+  lr_warmup_epochs: 5
+  lora_refresh_every: 1
+  # RTX 4090 的平台通常 ≥ 16 核 → 8 workers
+  num_workers: 8                 # 4 → 8
+  prefetch_factor: 3             # 2 → 3
   resume: true

@@ -295,11 +295,12 @@ def build_models(cfg, device, train_llm=True):
     eeg_queue = ContrastiveQueue(embed_dim=embed_dim, queue_size=qs, n_classes=3).to(device)
     print(f"[MoCo] queue_size={qs}  momentum={mm}")
 
-    # warmup
+    # warmup (compilation on first forward — progress shown)
     if _is_cuda_device(device):
         with torch.no_grad():
             d = torch.zeros(1, 1, mcfg["eegnet"]["chans"],
                             mcfg["eegnet"]["samples"], device=device)
+            print("[GPU] Running warmup forward (torch.compile + CUDA — may take 30-90s)...", flush=True)
             _ = eeg(d); _ = eeg_momentum(d)
             if train_llm: _ = text(["warmup"])
         torch.cuda.synchronize(_torch_device(device))

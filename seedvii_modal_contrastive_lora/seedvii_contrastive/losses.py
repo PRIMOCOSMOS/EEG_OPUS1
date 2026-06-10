@@ -185,6 +185,7 @@ class TriContrastiveLoss(nn.Module):
         temperature: float = 0.07,
         beta_eeg: float = 0.65,
         beta_llm: float = 0.35,
+        intra_weight: float = 1.0,
     ):
         super().__init__()
         s = beta_eeg + beta_llm
@@ -194,6 +195,11 @@ class TriContrastiveLoss(nn.Module):
         self.temperature = temperature
         self.beta_eeg = beta_eeg
         self.beta_llm = beta_llm
+        # intra_weight (lambda): 模态内损失整体相对跨模态(inter)的权重。
+        # total = l_inter + intra_weight * (beta_eeg*l_eeg + beta_llm*l_llm)
+        # =1.0 时与旧行为完全一致(向后兼容); <1 让 inter(跨模态对齐, eval考的)主导,
+        # 抑制模态内塌缩捷径。推荐 0.2~0.5。
+        self.intra_weight = float(intra_weight)
 
     def forward(
         self,
@@ -227,7 +233,7 @@ class TriContrastiveLoss(nn.Module):
         )
         l_llm = intra_modal_supcon(text_z, labels, self.temperature)
 
-        total = l_inter + self.beta_eeg * l_eeg + self.beta_llm * l_llm
+        total = l_inter + self.intra_weight * (self.beta_eeg * l_eeg + self.beta_llm * l_llm)
 
         return {
             "loss": total,

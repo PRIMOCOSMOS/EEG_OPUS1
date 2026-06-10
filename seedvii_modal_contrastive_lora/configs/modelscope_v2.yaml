@@ -1,0 +1,91 @@
+# SEED-VII EEG-LLM Contrastive Learning Configuration
+# -- v4-final: RTX 4090 优化 (TF32 + torch.compile + AdamW fused + MoCo) --
+
+seed: 42
+
+runtime:
+  device: auto
+  output_dir: /mnt/workspace/seedvii_contrastive_runs/run_valence3
+  max_hours: 9.5
+  save_every_minutes: 30
+
+data:
+  modelscope_dataset_id: DEREKVERSE/SEED-VII
+  local_dataset_dir: /mnt/workspace/seedvii_ms_dataset
+  eeg_root: /mnt/workspace/seedvii_ms_dataset
+  text_csv_path: /mnt/workspace/seedvii_ms_dataset/text_protocol.csv
+  npz_dir: /mnt/workspace/seedvii_npz
+  fs: 200
+  window_sec: 4.0
+  stride_sec: 4.0
+  center_ratio: 0.60
+  max_windows_per_clip: 12
+  shard_size: 512
+  train_subjects: [1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16]
+  val_subjects: [17,18,19,20]
+  cache_size: 16
+
+model:
+  embed_dim: 256
+  eegnet:
+    chans: 62
+    samples: 800
+    F1: 16
+    D: 2
+    F2: 64           # v1=32 -> 64: 加宽瓶颈
+    kernel_length: 100   # ≈ fs/2 (200Hz), EEGNet 论文推荐, 覆盖到最低频节律
+    dropout: 0.5     # 跨被试(train1-16/val17-20)用 0.5; 被试内可用 0.25
+    time_pool: 4     # proj 前保留 4 个时间段 (v1 等价于 1=全局平均)
+    spatial_max_norm: 1.0   # EEGNet 论文: depthwise 空间卷积 max_norm=1
+    dense_max_norm: 0.25    # EEGNet 论文: 末端全连接 max_norm=0.25
+    # 进入投影头维度 = F2*time_pool = 256, 不再被卡在 32 维
+  llm:
+    model_name_or_path: /mnt/workspace/models/Qwen2.5-0.5B-Instruct
+    modelscope_model_id: Qwen/Qwen2.5-0.5B-Instruct
+    max_length: 64
+    lora_r: 8
+    lora_alpha: 16
+    lora_dropout: 0.05
+    target_modules: [q_proj, k_proj, v_proj, o_proj]
+    gradient_checkpointing: false
+
+# ── MoCo ──
+# 3 类任务不需要 4096 的大队列(同类正样本过多 -> 抬高 loss 下限 + 助长塌缩)。
+# 缩到 512, 关闭自适应温度, 让跨模态对齐(inter)成为主导信号。
+moco:
+  queue_size: 512        # 4096 -> 512 (3类够用; loss 下限从~7.3降到~5.3)
+  momentum: 0.99         # 0.999 -> 0.99 (短训练; key 编码器跟得上, 目标更新鲜)
+  warmup_queue_steps: 256  # 队列在首个 epoch 内逐步填满, 过渡平滑
+  tau_queue_adaptive: false  # 关掉自适应, 去掉一个漂移变量
+  tau_queue_target: 0.10
+
+loss:
+  temperature: 0.10      # 定死中低温(不再 warmup 漂移), loss 基准线稳定可读
+  temperature_warmup_start: 0.10
+  temperature_warmup_epochs: 0  # 关闭温度 warmup
+  # 注意: TriContrastiveLoss 内部会把 beta_eeg/beta_llm 归一化到和为1,
+  # 而 total = l_inter(权重恒为1) + beta_eeg*l_eeg + beta_llm*l_llm。
+  # 所以 beta 只调"两个模态内项之间"的比例, 无法直接削弱 intra 相对 inter 的占比。
+  # 这里把 EEG 模态内占比调高(它带队列、和判别最相关), 削弱纯文本自对比。
+  # 若要真正让 inter 主导(推荐), 见下方 loss_weights 并需配合 losses.py 的可选支持。
+  beta_eeg: 0.8
+  beta_llm: 0.2
+  intra_weight: 0.3      # v2 新增: 模态内损失整体权重(相对inter)。
+                         # total = inter + 0.3*(beta_eeg*eeg_intra + beta_llm*llm_intra)
+                         # =1.0 与旧版一致; 0.3 让跨模态对齐主导, 抑制塌缩。
+
+train:
+  # RTX 4090 (24 GB): Qwen 0.5B BF16 ≈ 1 GB → 可以开到 192-256
+  batch_size: 192                # 96 → 192 (VRAM 充裕)
+  steps_per_epoch: 300
+  epochs: 50
+  lr_eeg: 0.002          # 0.001 -> 0.002: EEG塔已增容, 适当提速让它跟上LoRA
+  lr_llm: 0.00005
+  lr_proj: 0.0002
+  weight_decay: 0.00001
+  lr_warmup_epochs: 3    # 5 -> 3: 缩短warmup, 前期别压LR太久
+  lora_refresh_every: 1
+  # RTX 4090 的平台通常 ≥ 16 核 → 8 workers
+  num_workers: 8                 # 4 → 8
+  prefetch_factor: 3             # 2 → 3
+  resume: true

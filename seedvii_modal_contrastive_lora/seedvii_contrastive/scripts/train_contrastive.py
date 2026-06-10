@@ -506,6 +506,7 @@ def main():
     criterion = TriContrastiveLoss(
         temperature=lcfg.get("temperature", 0.25),
         beta_eeg=lcfg.get("beta_eeg", 0.65), beta_llm=lcfg.get("beta_llm", 0.35),
+        intra_weight=lcfg.get("intra_weight", 1.0),
     )
     print(f"[Criterion] {criterion}")
     lora_refresh_every = tcfg.get("lora_refresh_every", 1)

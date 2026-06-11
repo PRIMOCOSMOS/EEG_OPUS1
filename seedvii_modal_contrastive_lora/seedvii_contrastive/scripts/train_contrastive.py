@@ -233,7 +233,72 @@ def precompute_text_embeddings(text_tower, texts, device, batch_size=32):
     print(f"[Precompute] Done. shape={text_embs.shape} device={text_embs.device}")
     return text_embs
 
-def build_class_prototypes(text_embs, text_labels, device):
+# Route-A (3-class emotion recognition) uses *three class-prompt vectors* as
+# classification prototypes.  The 80 L2 trial texts are still read from the CSV
+# and are still used by the SupCon branch; they are just no longer averaged into
+# the three evaluation/CE prototypes.
+VALENCE_CLASS_NAMES = ["negative", "neutral", "positive"]
+DEFAULT_CLASS_PROMPT_TEXTS = [
+    "This EEG segment corresponds to a negative emotional state.",
+    "This EEG segment corresponds to a neutral emotional state.",
+    "This EEG segment corresponds to a positive emotional state.",
+]
+
+
+def get_class_prompt_texts(cfg: dict) -> list[str]:
+    """Return three class-prompt texts in label order: negative, neutral, positive.
+
+    Can be overridden by either::
+
+      data.class_prompt_texts: [negative_prompt, neutral_prompt, positive_prompt]
+
+    or a dict with keys negative/neutral/positive (or 0/1/2).
+    """
+    raw = cfg.get("data", {}).get("class_prompt_texts")
+    if raw is None:
+        raw = cfg.get("model", {}).get("llm", {}).get("class_prompt_texts")
+
+    if raw is None:
+        texts = DEFAULT_CLASS_PROMPT_TEXTS
+    elif isinstance(raw, (list, tuple)):
+        if len(raw) != 3:
+            raise ValueError("class_prompt_texts list must contain exactly 3 prompts")
+        texts = [str(x) for x in raw]
+    elif isinstance(raw, dict):
+        texts = []
+        for i, name in enumerate(VALENCE_CLASS_NAMES):
+            val = raw.get(name, raw.get(str(i), raw.get(i)))
+            if val is None:
+                raise ValueError(
+                    "class_prompt_texts dict must contain negative/neutral/positive "
+                    "or 0/1/2 keys"
+                )
+            texts.append(str(val))
+    else:
+        raise TypeError("class_prompt_texts must be a list[3] or dict")
+
+    print("[Text Tower] Class-prompt prototypes:")
+    for i, (name, txt) in enumerate(zip(VALENCE_CLASS_NAMES, texts)):
+        print(f"  [{i}:{name}] {txt}")
+    return texts
+
+
+@torch.no_grad()
+def build_class_prompt_prototypes(text_tower, class_prompt_texts, device):
+    """Encode the 3 class prompts -> (3, dim) normalized class prototypes."""
+    if len(class_prompt_texts) != 3:
+        raise ValueError(f"expected 3 class prompts, got {len(class_prompt_texts)}")
+    print("[Precompute] Encoding 3 class-prompt prototypes...")
+    text_tower.eval()
+    with _amp_context(device):
+        class_z = text_tower(list(class_prompt_texts)).float()
+    class_z = F.normalize(class_z, dim=-1)
+    print(f"[Precompute] Class prototypes done. shape={class_z.shape} device={class_z.device}")
+    return class_z
+
+
+def build_class_prototypes_from_l2(text_embs, text_labels, device):
+    """Legacy fallback: average the 80 L2 text embeddings into 3 class prototypes."""
     prototypes = []
     for c in range(3):
         mask = text_labels == c
@@ -242,10 +307,20 @@ def build_class_prototypes(text_embs, text_labels, device):
         prototypes.append(proto)
     return torch.stack(prototypes, dim=0)
 
-def refresh_text_cache(text_tower, bank_texts, bank_labels, device):
+
+def refresh_text_cache(text_tower, bank_texts, bank_labels, device, class_prompt_texts=None):
+    """Refresh cached 80 L2 embeddings and 3 class-prompt prototypes.
+
+    bank_texts: the 80 trial-level L2 texts from text_protocol.csv (SupCon branch)
+    class_prompt_texts: exactly 3 prompt texts used as CE/evaluation prototypes
+    """
     text_tower.eval()
     te = precompute_text_embeddings(text_tower, bank_texts, device, batch_size=32)
-    cz = build_class_prototypes(te, bank_labels, device)
+    if class_prompt_texts is None:
+        print("[Precompute][WARN] class_prompt_texts missing; falling back to averaged L2 prototypes")
+        cz = build_class_prototypes_from_l2(te, bank_labels, device)
+    else:
+        cz = build_class_prompt_prototypes(text_tower, class_prompt_texts, device)
     return te, cz
 
 
@@ -468,12 +543,17 @@ def main():
     eeg, eeg_momentum, eeg_queue, text = build_models(cfg, device, train_llm=train_llm)
     gpu_monitor.log_memory("After model loading")
 
+    # 80 trial-level L2 texts are still loaded from the CSV and used for SupCon.
     bank_texts, bank_labels_np, _ = build_l2_text_bank(dcfg["text_csv_path"])
     bank_labels = torch.tensor(bank_labels_np, dtype=torch.long, device=device)
+    # 3 class-prompt texts are encoded separately and used as CE/eval prototypes.
+    class_prompt_texts = get_class_prompt_texts(cfg)
 
     # ═══════════ text cache (GPU-resident) ═══════════
     print("\n[Step 3/7] Initializing text cache...")
-    text_embs_gpu, class_z = refresh_text_cache(text, bank_texts, bank_labels, device)
+    text_embs_gpu, class_z = refresh_text_cache(
+        text, bank_texts, bank_labels, device, class_prompt_texts=class_prompt_texts
+    )
     # text_embs_gpu is already on device; class_z is on device
     trial_to_emb_idx = {trial: trial - 1 for trial in range(1, 81)}
 
@@ -508,9 +588,17 @@ def main():
         beta_eeg=lcfg.get("beta_eeg", 0.65), beta_llm=lcfg.get("beta_llm", 0.35),
         intra_weight=lcfg.get("intra_weight", 1.0),
     )
+    lambda_ce = float(lcfg.get("lambda_ce", 0.0))
+    ce_temperature = float(lcfg.get("ce_temperature", 0.10))
     print(f"[Criterion] {criterion}")
+    print(f"[Criterion] CE aux: lambda_ce={lambda_ce:.3f}, ce_temperature={ce_temperature:.3f}, "
+          "prototypes=3 class prompts")
     lora_refresh_every = tcfg.get("lora_refresh_every", 1)
     warmup_queue_steps = cfg["moco"].get("warmup_queue_steps", 96)
+    eeg_warmup_epochs = int(tcfg.get("eeg_warmup_epochs", 0))
+    if train_llm and eeg_warmup_epochs > 0:
+        print(f"[Train] EEG-only warmup: first {eeg_warmup_epochs} epochs use cached text embeddings; "
+              "LoRA receives no gradient during warmup.")
 
     # ──── cache gradient clipping param list (built once) ────
     _grad_clip_eeg = [p for p in eeg.parameters() if p.requires_grad]
@@ -525,7 +613,9 @@ def main():
             start_epoch = sd.get("epoch", 0); step = sd.get("step", 0)
             best_metric = sd.get("best_metric", 0.0)
             print("[Cache] Refreshing text embeddings after resume...")
-            text_embs_gpu, class_z = refresh_text_cache(text, bank_texts, bank_labels, device)
+            text_embs_gpu, class_z = refresh_text_cache(
+                text, bank_texts, bank_labels, device, class_prompt_texts=class_prompt_texts
+            )
             print(f"[Train] resumed epoch={start_epoch} step={step} queue_filled={eeg_queue.filled}")
         except Exception as e:
             print(f"[Train] WARNING: failed to resume: {e}")
@@ -544,19 +634,29 @@ def main():
     for epoch in range(start_epoch, tcfg["epochs"]):
         train_sampler.set_epoch(epoch)
         eeg.train(); eeg_momentum.train()
-        if train_llm: text.train()
+
+        # EEG-only warmup: keep text tower in eval and use cached 80 L2 embeddings.
+        # Consequently only EEG parameters receive gradients in these epochs.
+        in_eeg_warmup = train_llm and (epoch < eeg_warmup_epochs)
+        if train_llm:
+            if in_eeg_warmup:
+                text.eval()
+            else:
+                text.train()
 
         # ── queue state & temperature (ORDERING FIXED) ──
         queue_ready = eeg_queue.filled >= warmup_queue_steps
         current_temperature = _get_effective_temperature(cfg, epoch, queue_ready)
         criterion.temperature = current_temperature
 
-        do_lora_forward = train_llm and (epoch % lora_refresh_every == 0)
-        if train_llm and not do_lora_forward:
-            print(f"  [Cache] epoch {epoch}: using cached text embeddings")
+        do_lora_forward = train_llm and (not in_eeg_warmup) and (epoch % lora_refresh_every == 0)
+        if in_eeg_warmup:
+            print(f"  [Warmup] epoch {epoch}: EEG-only; using cached 80 L2 text embeddings")
+        elif train_llm and not do_lora_forward:
+            print(f"  [Cache] epoch {epoch}: using cached 80 L2 text embeddings")
 
         pbar = tqdm(train_loader, total=len(train_sampler), desc=f"epoch {epoch}", leave=False)
-        epoch_losses, epoch_inter = [], []
+        epoch_losses, epoch_inter, epoch_ce = [], [], []
         batch_times, gpu_times = [], []
 
         for batch_idx, batch in enumerate(pbar):
@@ -584,7 +684,20 @@ def main():
                     loss_dict = criterion(eeg_z, text_z, y, queue_z=qz, queue_labels=ql)
                 else:
                     loss_dict = criterion(eeg_z, text_z, y)
-                loss = loss_dict["loss"]
+
+                # SupCon + CE architecture for Route-A (3-class emotion recognition).
+                # CE logits use the 3 class-prompt vectors as fixed prototypes.  We
+                # detach them so the CE branch trains EEG to align to semantic class
+                # anchors instead of moving the text anchors to fit collapsed EEG.
+                contrastive_loss = loss_dict["loss"]
+                if lambda_ce > 0:
+                    ce_logits = eeg_z.float() @ class_z.detach().float().t() / ce_temperature
+                    loss_ce = F.cross_entropy(ce_logits, y)
+                else:
+                    loss_ce = contrastive_loss.new_zeros(())
+                loss = contrastive_loss + lambda_ce * loss_ce
+                loss_dict["contrastive"] = contrastive_loss.detach()
+                loss_dict["ce"] = loss_ce.detach()
 
             # ────── momentum encoder (no_grad, parallel stream) ──────
             with torch.no_grad():
@@ -604,7 +717,9 @@ def main():
             t_gpu = time.perf_counter() - t_gpu_start
             total_train_time += t_data + t_gpu
             batch_times.append(t_data); gpu_times.append(t_gpu)
-            epoch_losses.append(loss.item()); epoch_inter.append(loss_dict["inter"].item())
+            epoch_losses.append(loss.item())
+            epoch_inter.append(loss_dict["inter"].item())
+            epoch_ce.append(loss_dict["ce"].item())
 
             if (batch_idx + 1) % log_interval == 0:
                 avg_bt = sum(batch_times[-log_interval:]) / log_interval
@@ -612,6 +727,7 @@ def main():
                 pbar.set_postfix({
                     "loss": f"{loss.item():.4f}",
                     "inter": f"{loss_dict['inter'].item():.4f}",
+                    "ce": f"{loss_dict['ce'].item():.4f}",
                     "τ": f"{current_temperature:.3f}",
                     "Q": f"{eeg_queue.filled}",
                     "t": f"{avg_bt*1000:.0f}ms",
@@ -621,17 +737,21 @@ def main():
 
         sched.step()
 
-        if train_llm:
-            print(f"  [Cache] epoch {epoch}: refreshing text embeddings & prototypes...")
-            text_embs_gpu, class_z = refresh_text_cache(text, bank_texts, bank_labels, device)
+        if train_llm and not in_eeg_warmup:
+            print(f"  [Cache] epoch {epoch}: refreshing 80 L2 embeddings & class-prompt prototypes...")
+            text_embs_gpu, class_z = refresh_text_cache(
+                text, bank_texts, bank_labels, device, class_prompt_texts=class_prompt_texts
+            )
 
         metrics = evaluate(eeg, class_z, val_loader, device)
         avg_loss = sum(epoch_losses) / len(epoch_losses)
         avg_inter = sum(epoch_inter) / len(epoch_inter)
+        avg_ce = sum(epoch_ce) / len(epoch_ce) if epoch_ce else 0.0
         epoch_time = sum(batch_times)
 
         q_tag = "full" if queue_ready else f"warmup({eeg_queue.filled}/{warmup_queue_steps})"
-        print(f"epoch {epoch}: loss={avg_loss:.4f} inter={avg_inter:.4f} "
+        warm_tag = " EEG-warmup" if in_eeg_warmup else ""
+        print(f"epoch {epoch}{warm_tag}: loss={avg_loss:.4f} inter={avg_inter:.4f} ce={avg_ce:.4f} "
               f"acc={metrics['acc']:.4f} f1={metrics['macro_f1']:.4f} "
               f"τ={current_temperature:.3f} Q={q_tag}")
         print(f"  [Stats] time={epoch_time:.1f}s  "

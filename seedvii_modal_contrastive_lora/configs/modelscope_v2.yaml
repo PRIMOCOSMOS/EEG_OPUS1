@@ -1,11 +1,12 @@
-# SEED-VII EEG-LLM Contrastive Learning Configuration
-# -- v4-final: RTX 4090 优化 (TF32 + torch.compile + AdamW fused + MoCo) --
+# SEED-VII Route-A: 3-class EEG emotion recognition
+# SupCon(80 L2 trial texts from CSV) + CE(3 class-prompt prototypes)
+# First epochs are EEG-only warmup; LoRA can be enabled after warmup.
 
 seed: 42
 
 runtime:
   device: auto
-  output_dir: /mnt/workspace/seedvii_contrastive_runs/run_valence3
+  output_dir: /mnt/workspace/seedvii_contrastive_runs/run_valence3_supcon_ce
   max_hours: 9.5
   save_every_minutes: 30
 
@@ -25,6 +26,14 @@ data:
   val_subjects: [17,18,19,20]
   cache_size: 16
 
+  # Label order must match protocol.py: 0=negative, 1=neutral, 2=positive.
+  # These 3 prompt embeddings are used for CE logits and validation prototypes.
+  # The 80 L2 texts are still loaded from text_protocol.csv and used by SupCon.
+  class_prompt_texts:
+    - "This EEG segment corresponds to a negative emotional state."
+    - "This EEG segment corresponds to a neutral emotional state."
+    - "This EEG segment corresponds to a positive emotional state."
+
 model:
   embed_dim: 256
   eegnet:
@@ -32,13 +41,12 @@ model:
     samples: 800
     F1: 16
     D: 2
-    F2: 64           # v1=32 -> 64: 加宽瓶颈
-    kernel_length: 100   # ≈ fs/2 (200Hz), EEGNet 论文推荐, 覆盖到最低频节律
-    dropout: 0.5     # 跨被试(train1-16/val17-20)用 0.5; 被试内可用 0.25
-    time_pool: 4     # proj 前保留 4 个时间段 (v1 等价于 1=全局平均)
-    spatial_max_norm: 1.0   # EEGNet 论文: depthwise 空间卷积 max_norm=1
-    dense_max_norm: 0.25    # EEGNet 论文: 末端全连接 max_norm=0.25
-    # 进入投影头维度 = F2*time_pool = 256, 不再被卡在 32 维
+    F2: 64
+    kernel_length: 100
+    dropout: 0.25       # route-A warmup先用较低dropout，避免过强噪声导致EEG塌缩
+    time_pool: 4
+    spatial_max_norm: 1.0
+    dense_max_norm: 0.25
   llm:
     model_name_or_path: /mnt/workspace/models/Qwen2.5-0.5B-Instruct
     modelscope_model_id: Qwen/Qwen2.5-0.5B-Instruct
@@ -49,43 +57,48 @@ model:
     target_modules: [q_proj, k_proj, v_proj, o_proj]
     gradient_checkpointing: false
 
-# ── MoCo ──
-# 3 类任务不需要 4096 的大队列(同类正样本过多 -> 抬高 loss 下限 + 助长塌缩)。
-# 缩到 512, 关闭自适应温度, 让跨模态对齐(inter)成为主导信号。
+# Route-A先不用队列参与loss：队列仍会维护，但 warmup_queue_steps 极大，queue_ready 始终为 false。
+# 等 SupCon+CE 能稳定提升 macro-F1 且 EEG rank 不塌后，再把 warmup_queue_steps 改回 256/512。
 moco:
-  queue_size: 512        # 4096 -> 512 (3类够用; loss 下限从~7.3降到~5.3)
-  momentum: 0.99         # 0.999 -> 0.99 (短训练; key 编码器跟得上, 目标更新鲜)
-  warmup_queue_steps: 256  # 队列在首个 epoch 内逐步填满, 过渡平滑
-  tau_queue_adaptive: false  # 关掉自适应, 去掉一个漂移变量
+  queue_size: 256
+  momentum: 0.99
+  warmup_queue_steps: 100000000
+  tau_queue_adaptive: false
   tau_queue_target: 0.10
 
 loss:
-  temperature: 0.10      # 定死中低温(不再 warmup 漂移), loss 基准线稳定可读
-  temperature_warmup_start: 0.10
-  temperature_warmup_epochs: 0  # 关闭温度 warmup
-  # 注意: TriContrastiveLoss 内部会把 beta_eeg/beta_llm 归一化到和为1,
-  # 而 total = l_inter(权重恒为1) + beta_eeg*l_eeg + beta_llm*l_llm。
-  # 所以 beta 只调"两个模态内项之间"的比例, 无法直接削弱 intra 相对 inter 的占比。
-  # 这里把 EEG 模态内占比调高(它带队列、和判别最相关), 削弱纯文本自对比。
-  # 若要真正让 inter 主导(推荐), 见下方 loss_weights 并需配合 losses.py 的可选支持。
+  # 对三分类稳定性，先用较温和温度；不要一开始低温+队列+模态内一起压。
+  temperature: 0.25
+  temperature_warmup_start: 0.25
+  temperature_warmup_epochs: 0
+
+  # SupCon内部仍保留三项接口；但 route-A 首轮先关闭模态内项，让跨模态 inter + CE 主导。
   beta_eeg: 0.8
   beta_llm: 0.2
-  intra_weight: 0.3      # v2 新增: 模态内损失整体权重(相对inter)。
-                         # total = inter + 0.3*(beta_eeg*eeg_intra + beta_llm*llm_intra)
-                         # =1.0 与旧版一致; 0.3 让跨模态对齐主导, 抑制塌缩。
+  intra_weight: 0.0
+
+  # 新增：EEG -> 3个class-prompt prototype 的辅助CE。
+  # 总损失 = SupCon + lambda_ce * CE。
+  lambda_ce: 0.5
+  ce_temperature: 0.10
 
 train:
-  # RTX 4090 (24 GB): Qwen 0.5B BF16 ≈ 1 GB → 可以开到 192-256
-  batch_size: 192                # 96 → 192 (VRAM 充裕)
+  batch_size: 192
   steps_per_epoch: 300
   epochs: 50
-  lr_eeg: 0.002          # 0.001 -> 0.002: EEG塔已增容, 适当提速让它跟上LoRA
+
+  # EEG-only warmup: 即使命令行不加 --no-train-llm，前10个epoch也只训练EEG；
+  # LoRA从第10个epoch之后才通过实时文本forward得到梯度。
+  eeg_warmup_epochs: 10
+
+  lr_eeg: 0.001
   lr_llm: 0.00005
   lr_proj: 0.0002
   weight_decay: 0.00001
-  lr_warmup_epochs: 3    # 5 -> 3: 缩短warmup, 前期别压LR太久
+  lr_warmup_epochs: 3
   lora_refresh_every: 1
-  # RTX 4090 的平台通常 ≥ 16 核 → 8 workers
-  num_workers: 8                 # 4 → 8
-  prefetch_factor: 3             # 2 → 3
-  resume: true
+  num_workers: 8
+  prefetch_factor: 3
+
+  # 关键：改loss/原型/训练阶段后不要从旧塌缩checkpoint恢复。
+  resume: false

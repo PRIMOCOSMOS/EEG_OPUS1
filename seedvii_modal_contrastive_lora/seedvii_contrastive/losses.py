@@ -247,6 +247,7 @@ class TriContrastiveLoss(nn.Module):
             f"TriContrastiveLoss(\n"
             f"  temperature={self.temperature},\n"
             f"  beta_eeg={self.beta_eeg:.3f},\n"
-            f"  beta_llm={self.beta_llm:.3f}\n"
+            f"  beta_llm={self.beta_llm:.3f},\n"
+            f"  intra_weight={self.intra_weight:.3f}\n"
             f")"
         )

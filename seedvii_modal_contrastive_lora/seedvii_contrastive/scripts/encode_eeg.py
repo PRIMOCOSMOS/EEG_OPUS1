@@ -8,6 +8,7 @@ if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
 import argparse
+import os
 import numpy as np
 import torch
 from torch.utils.data import DataLoader
@@ -19,7 +20,7 @@ from seedvii_contrastive.data.dataset import (
 )
 from seedvii_contrastive.scripts.train_contrastive import (
     build_models, load_ckpt, validate_training_split,
-    _dataloader_worker_kwargs, _is_cuda_device,
+    _dl_kwargs, _is_cuda_device,
 )
 
 
@@ -71,11 +72,11 @@ def main():
     num_workers = cfg["train"].get("num_workers", 2)
     dl = DataLoader(ds, batch_size=cfg["train"]["batch_size"], shuffle=False,
                     collate_fn=collate_fn, pin_memory=_is_cuda_device(device),
-                    **_dataloader_worker_kwargs(num_workers, cfg["train"].get("prefetch_factor", 2)))
+                    **_dl_kwargs(num_workers, cfg["train"].get("prefetch_factor", 2)))
 
     # Class prototypes from current (trained) LLM tower
     bank_texts, bank_labels, _ = build_l2_text_bank(cfg["data"]["text_csv_path"])
-    bank_z = text(bank_texts).float()
+    bank_z = text.encode_batch_fast(bank_texts).float()
     protos = []
     for c in range(3):
         idx = torch.tensor(bank_labels == c, dtype=torch.bool, device=bank_z.device)
@@ -98,16 +99,47 @@ def main():
     if not embs:
         raise RuntimeError(f"no batches encoded for split {args.split!r}")
 
-    Path(args.out).parent.mkdir(parents=True, exist_ok=True)
-    np.savez_compressed(
-        args.out,
-        embedding=np.concatenate(embs, axis=0),
-        pred=np.asarray(preds),
-        label=np.asarray(labels),
-        subject=np.asarray(subjects),
-        trial=np.asarray(trials),
+    out_path = Path(args.out).expanduser().resolve()
+    out_dir = out_path.parent
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # Verify writable
+    if not os.access(str(out_dir), os.W_OK):
+        raise PermissionError(f"output directory not writable: {out_dir}")
+
+    # Atomic write: temp file in same directory → rename
+    # (avoids cross-filesystem rename issues with np.savez_compressed internals)
+    import tempfile, shutil
+    fd, tmp_path = tempfile.mkstemp(
+        suffix='.npz', prefix='.tmp_encode_', dir=str(out_dir)
     )
-    print("wrote", args.out)
+    os.close(fd)
+
+    try:
+        np.savez_compressed(
+            tmp_path,
+            embedding=np.concatenate(embs, axis=0),
+            pred=np.asarray(preds),
+            label=np.asarray(labels),
+            subject=np.asarray(subjects),
+            trial=np.asarray(trials),
+        )
+        # Atomic rename
+        shutil.move(tmp_path, str(out_path))
+
+        # Verify
+        if not out_path.exists():
+            raise RuntimeError(f'File vanished after write: {out_path}')
+        if out_path.stat().st_size == 0:
+            raise RuntimeError(f'File is empty: {out_path}')
+
+        size_mb = out_path.stat().st_size / (1024 * 1024)
+        print(f"saved: {out_path}  ({size_mb:.1f} MB)")
+    except Exception:
+        # Clean up temp file on failure
+        if Path(tmp_path).exists():
+            Path(tmp_path).unlink(missing_ok=True)
+        raise
 
 
 if __name__ == "__main__":

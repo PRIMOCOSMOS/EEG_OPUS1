@@ -30,9 +30,17 @@ data:
   # These 3 prompt embeddings are used for CE logits and validation prototypes.
   # The 80 L2 texts are still loaded from text_protocol.csv and used by SupCon.
   class_prompt_texts:
-    - "This EEG segment corresponds to a negative emotional state."
-    - "This EEG segment corresponds to a neutral emotional state."
-    - "This EEG segment corresponds to a positive emotional state."
+    - "The EEG pattern reflects an unpleasant negative emotional state, such as sadness, fear, anger, or disgust."
+    - "The EEG pattern reflects a calm neutral emotional state without clear positive or negative valence."
+    - "The EEG pattern reflects a pleasant positive emotional state, such as joy, happiness, or surprise."
+  # Prompt separation diagnostics.
+  # Raw LLM embeddings are usually anisotropic, so raw cosine is printed but not used
+  # as a hard gate by default.  The actionable check is mean-centered cosine, where
+  # the mean is estimated from the 80 L2 trial-text embeddings plus the 3 prompts.
+  class_prompt_raw_max_cosine_warn: null
+  class_prompt_raw_max_cosine_error: null
+  class_prompt_centered_max_cosine_warn: 0.90
+  class_prompt_centered_max_cosine_error: null
 
 model:
   embed_dim: 256

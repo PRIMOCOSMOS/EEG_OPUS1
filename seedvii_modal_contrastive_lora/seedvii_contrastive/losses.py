@@ -227,13 +227,23 @@ class TriContrastiveLoss(nn.Module):
             eeg_z, text_z, labels, self.temperature,
             queue_z=queue_z, queue_labels=queue_labels,
         )
-        l_eeg = intra_modal_supcon(
-            eeg_z, labels, self.temperature,
-            queue_z=queue_z, queue_labels=queue_labels,
-        )
-        l_llm = intra_modal_supcon(text_z, labels, self.temperature)
 
-        total = l_inter + self.intra_weight * (self.beta_eeg * l_eeg + self.beta_llm * l_llm)
+        # If intra_weight is 0, *really* disable the intra-modal branches instead
+        # of computing them and multiplying by 0.  This avoids wasted compute and
+        # prevents disabled branches from propagating NaN/Inf into the total loss.
+        if self.intra_weight > 0:
+            l_eeg = intra_modal_supcon(
+                eeg_z, labels, self.temperature,
+                queue_z=queue_z, queue_labels=queue_labels,
+            )
+            l_llm = intra_modal_supcon(text_z, labels, self.temperature)
+            intra = self.beta_eeg * l_eeg + self.beta_llm * l_llm
+        else:
+            l_eeg = l_inter.new_zeros(())
+            l_llm = l_inter.new_zeros(())
+            intra = l_inter.new_zeros(())
+
+        total = l_inter + self.intra_weight * intra
 
         return {
             "loss": total,

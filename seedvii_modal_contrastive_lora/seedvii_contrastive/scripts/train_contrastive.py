@@ -239,9 +239,9 @@ def precompute_text_embeddings(text_tower, texts, device, batch_size=32):
 # the three evaluation/CE prototypes.
 VALENCE_CLASS_NAMES = ["negative", "neutral", "positive"]
 DEFAULT_CLASS_PROMPT_TEXTS = [
-    "This EEG segment corresponds to a negative emotional state.",
-    "This EEG segment corresponds to a neutral emotional state.",
-    "This EEG segment corresponds to a positive emotional state.",
+    "The EEG pattern reflects an unpleasant negative emotional state, such as sadness, fear, anger, or disgust.",
+    "The EEG pattern reflects a calm neutral emotional state without clear positive or negative valence.",
+    "The EEG pattern reflects a pleasant positive emotional state, such as joy, happiness, or surprise.",
 ]
 
 
@@ -284,8 +284,24 @@ def get_class_prompt_texts(cfg: dict) -> list[str]:
 
 
 @torch.no_grad()
-def build_class_prompt_prototypes(text_tower, class_prompt_texts, device):
-    """Encode the 3 class prompts -> (3, dim) normalized class prototypes."""
+def build_class_prompt_prototypes(
+    text_tower,
+    class_prompt_texts,
+    device,
+    reference_text_embs: torch.Tensor | None = None,
+    raw_max_cosine_warn: float | None = None,
+    raw_max_cosine_error: float | None = None,
+    centered_max_cosine_warn: float | None = 0.90,
+    centered_max_cosine_error: float | None = None,
+):
+    """Encode the 3 class prompts -> (3, dim) normalized class prototypes.
+
+    Important: raw LLM sentence embeddings are often highly anisotropic, so raw
+    cosine can be high even for semantically distinct prompts.  Therefore raw
+    cosine is printed for transparency, but the actionable diagnostic is the
+    mean-centered cosine, where the mean is estimated from the 80 L2 trial-text
+    embeddings plus the 3 class prompts.
+    """
     if len(class_prompt_texts) != 3:
         raise ValueError(f"expected 3 class prompts, got {len(class_prompt_texts)}")
     print("[Precompute] Encoding 3 class-prompt prototypes...")
@@ -293,7 +309,44 @@ def build_class_prompt_prototypes(text_tower, class_prompt_texts, device):
     with _amp_context(device):
         class_z = text_tower(list(class_prompt_texts)).float()
     class_z = F.normalize(class_z, dim=-1)
+
+    def _cosine_report(name: str, z: torch.Tensor):
+        sim_t = (z.float() @ z.float().t()).detach().cpu()
+        sim = sim_t.tolist()
+        off_diag = sim_t[~torch.eye(3, dtype=torch.bool)].abs()
+        max_off_diag = float(off_diag.max().item())
+        print(f"[Precompute] {name} class-prototype cosine matrix:")
+        for row in sim:
+            print("  " + " ".join(f"{v:+.3f}" for v in row))
+        print(f"[Precompute] {name} max |off-diagonal cosine| = {max_off_diag:.3f}")
+        return max_off_diag
+
+    def _check_threshold(name: str, value: float, warn, error):
+        if error is not None and value >= float(error):
+            raise ValueError(
+                f"{name} class prompt prototypes are too similar: max |off-diagonal cosine| "
+                f"{value:.3f} >= error threshold {float(error):.3f}. "
+                "Make class_prompt_texts more discriminative or disable the error threshold."
+            )
+        if warn is not None and value >= float(warn):
+            print(
+                f"[Precompute][WARN] {name} class prompt prototypes are highly similar "
+                f"(max |off-diagonal cosine|={value:.3f} >= {float(warn):.3f})."
+            )
+
     print(f"[Precompute] Class prototypes done. shape={class_z.shape} device={class_z.device}")
+    raw_max = _cosine_report("RAW", class_z)
+    _check_threshold("RAW", raw_max, raw_max_cosine_warn, raw_max_cosine_error)
+
+    if reference_text_embs is not None:
+        ref = torch.cat([reference_text_embs.float().to(class_z.device), class_z.float()], dim=0)
+        mu = ref.mean(dim=0, keepdim=True)
+        class_z_centered = F.normalize(class_z.float() - mu, dim=-1)
+        centered_max = _cosine_report("MEAN-CENTERED", class_z_centered)
+        _check_threshold("MEAN-CENTERED", centered_max, centered_max_cosine_warn, centered_max_cosine_error)
+    else:
+        print("[Precompute][WARN] No reference text embeddings; skipped mean-centered prompt diagnostic.")
+
     return class_z
 
 
@@ -308,7 +361,17 @@ def build_class_prototypes_from_l2(text_embs, text_labels, device):
     return torch.stack(prototypes, dim=0)
 
 
-def refresh_text_cache(text_tower, bank_texts, bank_labels, device, class_prompt_texts=None):
+def refresh_text_cache(
+    text_tower,
+    bank_texts,
+    bank_labels,
+    device,
+    class_prompt_texts=None,
+    class_prompt_raw_max_cosine_warn: float | None = None,
+    class_prompt_raw_max_cosine_error: float | None = None,
+    class_prompt_centered_max_cosine_warn: float | None = 0.90,
+    class_prompt_centered_max_cosine_error: float | None = None,
+):
     """Refresh cached 80 L2 embeddings and 3 class-prompt prototypes.
 
     bank_texts: the 80 trial-level L2 texts from text_protocol.csv (SupCon branch)
@@ -320,7 +383,16 @@ def refresh_text_cache(text_tower, bank_texts, bank_labels, device, class_prompt
         print("[Precompute][WARN] class_prompt_texts missing; falling back to averaged L2 prototypes")
         cz = build_class_prototypes_from_l2(te, bank_labels, device)
     else:
-        cz = build_class_prompt_prototypes(text_tower, class_prompt_texts, device)
+        cz = build_class_prompt_prototypes(
+            text_tower,
+            class_prompt_texts,
+            device,
+            reference_text_embs=te,
+            raw_max_cosine_warn=class_prompt_raw_max_cosine_warn,
+            raw_max_cosine_error=class_prompt_raw_max_cosine_error,
+            centered_max_cosine_warn=class_prompt_centered_max_cosine_warn,
+            centered_max_cosine_error=class_prompt_centered_max_cosine_error,
+        )
     return te, cz
 
 
@@ -549,10 +621,40 @@ def main():
     # 3 class-prompt texts are encoded separately and used as CE/eval prototypes.
     class_prompt_texts = get_class_prompt_texts(cfg)
 
+    def _optional_float(value, default=None):
+        if value is None:
+            value = default
+        if isinstance(value, str) and value.strip().lower() in {"", "none", "null"}:
+            return None
+        return None if value is None else float(value)
+
+    # Raw LLM cosine is usually high due to anisotropy, so it is not a hard gate
+    # by default.  Centered cosine is the actionable prompt-separation diagnostic.
+    class_prompt_raw_max_cosine_warn = _optional_float(
+        dcfg.get("class_prompt_raw_max_cosine_warn", dcfg.get("class_prompt_max_cosine_warn", None))
+    )
+    class_prompt_raw_max_cosine_error = _optional_float(
+        dcfg.get("class_prompt_raw_max_cosine_error", None)
+    )
+    class_prompt_centered_max_cosine_warn = _optional_float(
+        dcfg.get("class_prompt_centered_max_cosine_warn", 0.90)
+    )
+    class_prompt_centered_max_cosine_error = _optional_float(
+        dcfg.get("class_prompt_centered_max_cosine_error", None)
+    )
+
     # ═══════════ text cache (GPU-resident) ═══════════
     print("\n[Step 3/7] Initializing text cache...")
     text_embs_gpu, class_z = refresh_text_cache(
-        text, bank_texts, bank_labels, device, class_prompt_texts=class_prompt_texts
+        text,
+        bank_texts,
+        bank_labels,
+        device,
+        class_prompt_texts=class_prompt_texts,
+        class_prompt_raw_max_cosine_warn=class_prompt_raw_max_cosine_warn,
+        class_prompt_raw_max_cosine_error=class_prompt_raw_max_cosine_error,
+        class_prompt_centered_max_cosine_warn=class_prompt_centered_max_cosine_warn,
+        class_prompt_centered_max_cosine_error=class_prompt_centered_max_cosine_error,
     )
     # text_embs_gpu is already on device; class_z is on device
     trial_to_emb_idx = {trial: trial - 1 for trial in range(1, 81)}
@@ -614,7 +716,15 @@ def main():
             best_metric = sd.get("best_metric", 0.0)
             print("[Cache] Refreshing text embeddings after resume...")
             text_embs_gpu, class_z = refresh_text_cache(
-                text, bank_texts, bank_labels, device, class_prompt_texts=class_prompt_texts
+                text,
+                bank_texts,
+                bank_labels,
+                device,
+                class_prompt_texts=class_prompt_texts,
+                class_prompt_raw_max_cosine_warn=class_prompt_raw_max_cosine_warn,
+                class_prompt_raw_max_cosine_error=class_prompt_raw_max_cosine_error,
+                class_prompt_centered_max_cosine_warn=class_prompt_centered_max_cosine_warn,
+                class_prompt_centered_max_cosine_error=class_prompt_centered_max_cosine_error,
             )
             print(f"[Train] resumed epoch={start_epoch} step={step} queue_filled={eeg_queue.filled}")
         except Exception as e:
@@ -740,7 +850,15 @@ def main():
         if train_llm and not in_eeg_warmup:
             print(f"  [Cache] epoch {epoch}: refreshing 80 L2 embeddings & class-prompt prototypes...")
             text_embs_gpu, class_z = refresh_text_cache(
-                text, bank_texts, bank_labels, device, class_prompt_texts=class_prompt_texts
+                text,
+                bank_texts,
+                bank_labels,
+                device,
+                class_prompt_texts=class_prompt_texts,
+                class_prompt_raw_max_cosine_warn=class_prompt_raw_max_cosine_warn,
+                class_prompt_raw_max_cosine_error=class_prompt_raw_max_cosine_error,
+                class_prompt_centered_max_cosine_warn=class_prompt_centered_max_cosine_warn,
+                class_prompt_centered_max_cosine_error=class_prompt_centered_max_cosine_error,
             )
 
         metrics = evaluate(eeg, class_z, val_loader, device)
